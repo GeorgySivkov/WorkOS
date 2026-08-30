@@ -37,7 +37,7 @@ CREATE TABLE work.identities (
   value      text NOT NULL,
   context_id text REFERENCES work.contexts(id),   -- NULL = обличье общее
   confidence real NOT NULL DEFAULT 1.0,      -- 1.0 детерминированно, ниже - разрешено моделью
-  UNIQUE (kind, value)
+  UNIQUE NULLS NOT DISTINCT (kind, value, context_id)
 );
 
 -- в каких контекстах человек присутствует и кем
