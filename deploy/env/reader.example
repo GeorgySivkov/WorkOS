@@ -7,8 +7,11 @@ PGUSER=workos_reader
 PGPASSWORD=
 CLAUDE_CODE_OAUTH_TOKEN=
 # кто такой «я»: свои адреса и id не заводятся людьми и не триажатся
+# WORKOS_SELF_EMAILS: все твои адреса через запятую (личный, Инфатика, Альфа)
 WORKOS_SELF_EMAILS=esivkove@gmail.com
+# WORKOS_SELF_HANDLES: твои id в Slack (U...) и Trello через запятую
 WORKOS_SELF_HANDLES=
+# WORKOS_SELF_NAMES: как тебя зовут в транскриптах, эти имена людьми не становятся
 WORKOS_SELF_NAMES=Георгий,Жора,Гоша,George
 # --- фаза 2 ---
 TRELLO_KEY=
@@ -31,6 +34,9 @@ EMBED_MODEL_DIR=/opt/workos/models/multilingual-e5-base
 EMBED_THREADS=1
 # --- персонаж ---
 GARMIN_TOKENS=/var/lib/workos-reader/.garminconnect
+# только на время `workctl.py garmin-login`: после входа токены лежат в GARMIN_TOKENS, пароль сотри
+# GARMIN_EMAIL=
+# GARMIN_PASSWORD=
 # --- фаза 5 ---
 # TRELLO_PROPOSE_LIST_ID=
 # --- фаза 7 ---

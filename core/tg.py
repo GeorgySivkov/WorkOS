@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 
@@ -42,8 +43,13 @@ class Bot:
 
     def download(self, file_id: str) -> bytes:
         f = self.call("getFile", file_id=file_id)
-        r = self.http.get(f"{self.base}/file/bot{self.token}/{f['file_path']}")
-        r.raise_for_status()
+        # в URL файла токен бота: ни raise_for_status, ни текст сетевой ошибки наружу не отдаём
+        try:
+            r = self.http.get(f"{self.base}/file/bot{self.token}/{f['file_path']}")
+        except httpx.HTTPError as e:
+            raise TgError("download", f"сеть: {type(e).__name__}: {scrub(str(e))}") from None
+        if r.status_code != 200:
+            raise TgError("download", f"HTTP {r.status_code}", r.status_code)
         return r.content
 
     def send(self, chat_id: int, text: str, thread_id: int | None = None, buttons=None,
@@ -71,6 +77,14 @@ class Bot:
             return self.call("answerCallbackQuery", callback_query_id=callback_id, text=text)
         except TgError:
             return None
+
+
+RX_TOKEN = re.compile(r"bot\d+:[\w-]+|\b\d{6,}:[\w-]{30,}")
+
+
+def scrub(text) -> str:
+    """Убирает токен бота из текста ошибки перед записью в базу, outbox или журнал."""
+    return RX_TOKEN.sub("bot<token>", str(text or ""))
 
 
 def btn(text: str, data: str) -> dict:

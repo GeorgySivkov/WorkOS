@@ -19,6 +19,7 @@ import json
 import queue
 import re
 import sys
+import threading
 import traceback
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -40,6 +41,9 @@ CTX_TITLES = {"infatica": "Инфатика", "alfa": "Альфа", "consulting"
 GAP_MIN = 45
 MAX_BODY = 64 * 1024
 TITLE_MAX = 500
+DEV_TOKEN_MIN = 32          # короче: перебор по сети реален, токен не принимается
+SOCKET_TIMEOUT = 15         # медленный клиент не держит поток-обработчик вечно
+MAX_THREADS = 32            # больше одновременных соединений не берём, лишние закрываются сразу
 TRAIN_RX = re.compile(r"трениров", re.I)
 
 CSP = ("default-src 'self'; script-src 'self' https://telegram.org; "
@@ -110,6 +114,17 @@ def task_times(r) -> tuple[datetime | None, datetime | None]:
     if s is not None and e is None:
         e = s + timedelta(minutes=config.SIZE_MINUTES[size_of(r)])
     return s, e
+
+
+def shift_remind(remind: datetime | None, old_due: date | None, new_due: date) -> datetime | None:
+    """Напоминание едет вместе с днём задачи: на (new_due - old_due) дней, в то же местное время."""
+    if remind is None:
+        return None
+    base = tu.logical_date(remind)
+    days = (new_due - (old_due or base)).days
+    if not days:
+        return remind
+    return tu.local_dt_for(base + timedelta(days=days), tu.local(remind).time())
 
 
 def task_obj(r, today: date) -> dict:
@@ -207,7 +222,11 @@ class Api:
         self.pool = Pool(connect or (lambda: db.connect(autocommit=True)), pool_size)
         self.clock = clock or tu.now
         self.auth_kw = {"bot_id": bot_id, "owner_id": owner_id, "public_key": public_key}
-        self.dev_token = (config.env("APP_DEV_TOKEN") or "") if dev_token is None else dev_token
+        tok = (config.env("APP_DEV_TOKEN") or "") if dev_token is None else dev_token
+        if tok and len(tok) < DEV_TOKEN_MIN:
+            log(f"APP_DEV_TOKEN короче {DEV_TOKEN_MIN} символов: игнорирую, вход dev выключен")
+            tok = ""
+        self.dev_token = tok
 
     # --- вход ---
     def authorize(self, header: str | None) -> dict:
@@ -218,7 +237,7 @@ class Api:
                 return initdata.validate(value, **self.auth_kw)
             except initdata.InitDataError as e:
                 log(f"401: {e}")
-        elif scheme == "dev" and self.dev_token and value \
+        elif scheme == "dev" and len(self.dev_token or "") >= DEV_TOKEN_MIN and value \
                 and hmac.compare_digest(value.encode(), self.dev_token.encode()):
             return {"user": {"id": "dev"}}
         raise HttpError(401, "unauthorized")
@@ -259,6 +278,15 @@ class Api:
         r = conn.execute("SELECT xp, level, level_floor, next_level_at FROM rpg.character").fetchone()
         return {"name": NAME, "level": int(r["level"]), "xp": int(r["xp"]),
                 "level_floor": int(r["level_floor"]), "next_level_at": int(r["next_level_at"])}
+
+    @staticmethod
+    def level_up(conn, before: dict, after: dict) -> bool:
+        """Повышение показывается один раз: выше наибольшего уже достигнутого уровня
+        (сделал, снял, снова сделал: второй раз салюта нет)."""
+        if after["level"] <= before["level"]:
+            return False
+        return bool(conn.execute("SELECT rpg.app_level_up(%s, %s) AS up",
+                                 (before["level"], after["level"])).fetchone()["up"])
 
     @staticmethod
     def _task_row(conn, task_id: int):
@@ -470,20 +498,21 @@ class Api:
         row = self._task_row(conn, tid)
         if row is None or (row["dropped_at"] is not None and action != "drop"):
             raise HttpError(404, "not_found")
-        touched = "planned_at = now()," if row["planned_start"] is not None else ""
 
+        # planned_at = «время задачи менялось в базе»: писатель календаря по нему решает, что
+        # база свежее ручного переноса в Google. Отметка «сделано» время не меняет и его не трогает.
         if action == "done":
             before = self.character_of(conn)
             if row["done_at"] is None:
-                conn.execute(f"UPDATE work.tasks SET {touched} done_at = %s WHERE id = %s", (now, tid))
+                conn.execute("UPDATE work.tasks SET done_at = %s WHERE id = %s", (now, tid))
             xp = conn.execute("SELECT rpg.award_task(%s) AS n", (tid,)).fetchone()["n"] or 0
             after = self.character_of(conn)
             return {"task": task_obj(self._task_row(conn, tid), today), "xp": int(xp),
-                    "level_up": after["level"] > before["level"], "character": after}
+                    "level_up": self.level_up(conn, before, after), "character": after}
 
         if action == "undone":
             if row["done_at"] is not None:
-                conn.execute(f"UPDATE work.tasks SET {touched} done_at = NULL WHERE id = %s", (tid,))
+                conn.execute("UPDATE work.tasks SET done_at = NULL WHERE id = %s", (tid,))
             conn.execute("SELECT rpg.revoke_task(%s)", (tid,))
             return {"task": task_obj(self._task_row(conn, tid), today), "character": self.character_of(conn)}
 
@@ -491,20 +520,23 @@ class Api:
             if row["done_at"] is not None:
                 raise HttpError(400, "bad_request", "задача уже сделана")
             tomorrow = today + timedelta(days=1)
-            remind = row["remind_at"]
-            if remind is not None:
-                remind = tu.at_local(tomorrow, tu.local(remind).time())
+            remind = shift_remind(row["remind_at"], row["due"], tomorrow)
             conn.execute(
-                """UPDATE work.tasks SET due = %s, week_of = NULL, remind_at = %s, reminded_at = NULL,
-                          planned_start = NULL, planned_end = NULL, planned_by = NULL, planned_at = now()
-                   WHERE id = %s""", (tomorrow, remind, tid))
+                """UPDATE work.tasks SET due = %s, week_of = NULL, remind_at = %s,
+                          reminded_at = CASE WHEN remind_at IS DISTINCT FROM %s THEN NULL ELSE reminded_at END,
+                          planned_at = CASE WHEN planned_start IS NOT NULL OR planned_end IS NOT NULL
+                                            THEN now() ELSE planned_at END,
+                          planned_start = NULL, planned_end = NULL, planned_by = NULL
+                   WHERE id = %s""", (tomorrow, remind, remind, tid))
             return task_obj(self._task_row(conn, tid), today)
 
         # drop: «удалить» не стирает, а помечает; блок в календаре снимет писатель календаря
         if row["dropped_at"] is None:
             conn.execute(
-                f"""UPDATE work.tasks SET {touched} dropped_at = %s,
-                           planned_start = NULL, planned_end = NULL, planned_by = NULL WHERE id = %s""",
+                """UPDATE work.tasks SET dropped_at = %s,
+                          planned_at = CASE WHEN planned_start IS NOT NULL OR planned_end IS NOT NULL
+                                            THEN now() ELSE planned_at END,
+                          planned_start = NULL, planned_end = NULL, planned_by = NULL WHERE id = %s""",
                 (now, tid))
         return {"ok": True}
 
@@ -517,20 +549,26 @@ class Api:
         if cell["auto_source"]:
             raise HttpError(400, "auto", "эта привычка отмечается сама")
         before = self.character_of(conn)
-        marked = conn.execute(
-            """SELECT EXISTS (SELECT 1 FROM rpg.xp WHERE cell_id = %(c)s AND source = 'manual'
-                   AND source_ref = %(c)s || ':' || to_char(rpg.lday(now()), 'YYYY-MM-DD')) AS m""",
-            {"c": cell_id}).fetchone()["m"]
-        if marked:
+        # руками переключается только ручная отметка; отметку задачей на этой клетке
+        # (или из Garmin, пока у клетки был источник) кнопка не снимает и не задваивает
+        st = conn.execute(
+            """SELECT COALESCE(bool_or(x.source = 'manual' AND x.source_ref = k.ref), false) AS manual,
+                      COALESCE(bool_or(NOT (x.source = 'manual' AND x.source_ref = k.ref)), false) AS other
+               FROM (SELECT %(c)s || ':' || to_char(rpg.lday(now()), 'YYYY-MM-DD') AS ref) k
+               LEFT JOIN rpg.xp x ON x.cell_id = %(c)s AND rpg.lday(x.earned_at) = rpg.lday(now())""",
+            {"c": cell_id}).fetchone()
+        if st["manual"]:
             conn.execute("SELECT rpg.revoke_manual(%s)", (cell_id,))
             xp = 0
+        elif st["other"]:
+            return {"done": True, "xp": 0, "level_up": False, "locked": True, "character": before}
         else:
             xp = conn.execute("SELECT rpg.log_manual(%s) AS n", (cell_id,)).fetchone()["n"] or 0
         done = conn.execute("SELECT EXISTS (SELECT 1 FROM rpg.xp WHERE cell_id = %s "
                             "AND rpg.lday(earned_at) = rpg.lday(now())) AS d", (cell_id,)).fetchone()["d"]
         after = self.character_of(conn)
-        return {"done": bool(done), "xp": int(xp), "level_up": after["level"] > before["level"],
-                "character": after}
+        return {"done": bool(done), "xp": int(xp), "level_up": self.level_up(conn, before, after),
+                "locked": False, "character": after}
 
     # --- POST /api/replan ---
     def r_replan(self, conn, query, body):
@@ -614,6 +652,7 @@ class Api:
 class Handler(BaseHTTPRequestHandler):
     server_version = "workos-app"
     sys_version = ""
+    timeout = SOCKET_TIMEOUT
 
     def do_GET(self):
         self._serve("GET")
@@ -640,6 +679,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(405, {"error": "method_not_allowed"})
         except HttpError as e:
             self._send_json(e.status, e.payload)
+        except (TimeoutError, ConnectionError):
+            self.close_connection = True          # клиент не дослал тело или ушёл: отвечать некому
         except Exception:
             traceback.print_exc(file=sys.stderr)
             self._send_json(500, {"error": "internal"})
@@ -691,10 +732,35 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("workos-app: %s\n" % (fmt % args))
 
 
-def make_server(host: str = "127.0.0.1", port: int | None = None, api: Api | None = None) -> ThreadingHTTPServer:
+class Server(ThreadingHTTPServer):
+    """Поток на соединение, но не больше MAX_THREADS сразу: лишние закрываются без ответа."""
+    daemon_threads = True
+
+    def __init__(self, addr, handler, max_threads: int = MAX_THREADS):
+        super().__init__(addr, handler)
+        self.slots = threading.BoundedSemaphore(max_threads)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
+def make_server(host: str = "127.0.0.1", port: int | None = None, api: Api | None = None,
+                max_threads: int = MAX_THREADS) -> ThreadingHTTPServer:
     port = config.env_int("APP_PORT", 8787) if port is None else port
-    srv = ThreadingHTTPServer((host, port), Handler)
-    srv.daemon_threads = True
+    srv = Server((host, port), Handler, max_threads)
     srv.api = api or Api()
     return srv
 

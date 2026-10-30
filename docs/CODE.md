@@ -21,7 +21,7 @@ Python 3.10+ (на дроплете 3.10/3.12, тесты гоняются на 
 - bot: SELECT contexts, people, identities, person_contexts, events, actions, identity_candidates,
   outbox, sources, decisions, commitments, tasks, rpg.*, calendar_feed, autonomy, outcomes;
   INSERT events, actions, outcomes, identities, outbox, tasks, bot_topics;
-  UPDATE events(meta, context_id), actions(status, approved_at, approval_nonce, approved_hash,
+  UPDATE events(meta, context_id), actions(status, approved_at, approval_nonce, shown_hash, approved_hash,
   decided_at, result), tasks(reminded_at, dropped_at, due, week_of, remind_at, cell_id, size,
   context_id, title, planned_*), outbox(sent_at, tg_message_id), identity_candidates(status),
   autonomy(mode, locked, changed_at, reason).
@@ -55,6 +55,14 @@ Python 3.10+ (на дроплете 3.10/3.12, тесты гоняются на 
 - `core.google` — `GoogleAuth(refresh_env).token()`, `client(refresh_env, transport=None)` -> httpx.Client
   с Bearer. Секреты: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `<NAME>_REFRESH_TOKEN`.
 
+## Кто такой «я» (env)
+
+`WORKOS_SELF_EMAILS` (все адреса George через запятую), `WORKOS_SELF_HANDLES` (его id в Slack и
+Trello), `WORKOS_SELF_NAMES` (как его зовут в транскриптах, по умолчанию «Георгий,Жора,Гоша,George»).
+Свои адреса и id не становятся людьми и не триажатся, свои имена не разрешаются в людей.
+Старые `WORKOS_ME_EMAILS` / `WORKOS_ME_SLACK_IDS` понимаются для совместимости, новые места их не читают.
+`WORKOS_ME_PERSON_ID` (необязательно): строка George в work.people, если она завелась.
+
 ## Таблицы, которые важно понимать
 
 - `work.events` — всё входящее; уникально `(source_id, external_id)`. Календарные события:
@@ -66,22 +74,39 @@ Python 3.10+ (на дроплете 3.10/3.12, тесты гоняются на 
 - `work.outbox(topic, text, buttons jsonb, ref_action)` — всё, что система хочет сказать.
   `text` в HTML-разметке Telegram, `buttons` = список рядов `[[{text, callback_data}], ...]`.
   Отправляет только бот; в тихие часы (1:00-8:00) ждёт утра.
-- `work.actions(type, payload, status, autonomy, approved_hash, replaces, result)`.
+- `work.actions(type, payload, status, autonomy, shown_hash, approved_hash, replaces, result)`.
+- `work.notices(key, sent_at)`: дедуп и отметки «сделано»: `extract:<event>` (встреча разобрана
+  или пропущена после сбоев), `trello:<event>`, `draft:<event>` (сдался драфтер), `idc:<cand>`,
+  `brief:<дата>`, `card:...`, `review:<пн>`, `audit:<пн>`, `health:<источник>` / `health:app` /
+  `health:backup` (открытый инцидент), `backup:<дата>` (удачный бэкап, пишет deploy/backup.sh под админом).
 - `work.tasks` — дела; `planned_start/end`, `planned_by` auto|manual, `block_synced_at`.
 - `rpg.*` — сетка, опыт, виды `rpg.attributes`, `rpg.character`.
 
 ## Типы действий и строгие схемы payload
 
-Предлагает читатель (INSERT в actions со status='proposed'), одобряет бот (кнопка с user id George
-+ approved_hash = sha256(payload::text), посчитанный SQL-выражением в момент показа карточки).
+Предлагает читатель (INSERT в actions со status='proposed'), одобряет бот. Два хеша, оба
+sha256(payload::text), посчитанные SQL-выражением, а не в Python:
+- `shown_hash` пишется в момент показа карточки (то, что George видел); первые 8 hex едут в callback;
+- `approved_hash` ставится ТОЛЬКО нажатием «Одобрить»/«Черновиком» (кнопка с user id George), и только
+  если хеш текущего payload равен shown_hash и префиксу на кнопке. Исполнитель сверяет approved_hash
+  с текущим payload: текст, которого George не видел, наружу не уйдёт.
+
+Без нажатия бот одобряет только внутренние типы `plan_batch` и `task_add`, и только по своей выборке
+из work.autonomy (`actions.autonomy`, который пишет предлагающий, не читается). Всё, что видно снаружи
+(trello_card, email_reply, slack_post), всегда идёт на подтверждение. Режимы двигает
+`work.autonomy_recompute()` (SQL, 009), общий рубильник `/manual` это строка ('*', '*').
 
 | type          | Кто исполняет | payload |
 |---------------|---------------|---------|
-| plan_batch    | бот (внутреннее) | `{for_date: 'YYYY-MM-DD', items: [{title, size, context_id?, cell_id?, start?, end?}], week_items: [{title, size?, context_id?}]}` |
+| plan_batch    | бот (внутреннее) | `{for_date: 'YYYY-MM-DD', items: [{title, size, context_id?, cell_id?, task_id?, start?, end?, fixed?}], week_items: [{title, size?, context_id?}]}` |
 | task_add      | бот (внутреннее) | `{title, due?: 'YYYY-MM-DD', time?: 'HH:MM', size: 'S'|'M'|'L', context_id?, cell_id?, commitment_id?}` |
 | trello_card   | executors/trello | `{list_id, name, desc, labels: [str], checklist?: {name, items: [str]}, due?: ISO}` |
 | email_reply   | executors/gmail (только черновик) | `{account, to: [str], cc: [str], subject, body, thread_id?, in_reply_to?, references?}` |
 | slack_post    | executors/slack | `{channel, text, thread_ts?}` |
+
+В `plan_batch`: `task_id` значит «двинуть существующую задачу» (новая не заводится, в карточке
+пометка «перенос»); `fixed: true` значит время назвал сам George («в 10»), такая задача сохраняется
+с `planned_by='manual'` и расстановщик её не двигает. Без `fixed` время это предложение (`auto`).
 
 Статусы: proposed -> approved -> executed|failed; proposed -> drafted (оставить черновиком:
 исполнитель создаёт объект и не отправляет) | rejected | edited (заменено новой строкой с
@@ -98,7 +123,41 @@ ORDER BY approved_at FOR UPDATE SKIP LOCKED;
 ## Префиксы callback_data бота
 
 `cap:` захват · `pb:` карточка плана · `act:` карточка действия · `idc:` кандидат в людях ·
-`ask:` уточнение в «Спросить» · `rb:` откат автономного действия · `<домен>:` кнопки домена.
+`ask:` уточнение в «Спросить» · `rb:` откат автономного действия · `tk:` кнопки задачи ·
+`<домен>:` кнопки домена. Все данные кнопки не длиннее 64 байт.
+
+| callback | что делает |
+|----------|------------|
+| `cap:<event_id>:task\|idea\|fact` | поправить класс захвата |
+| `cap:<event_id>:ctx:<context_id>` | поправить контекст |
+| `cap:<event_id>:cell` | показать выбор клетки персонажа |
+| `cap:<event_id>:c:<cell_id\|->` | поставить клетку (`-` = без клетки) |
+| `tk:<task_id>:1h` | напомнить через час |
+| `tk:<task_id>:tmr` | перенести на завтра |
+| `tk:<task_id>:keep` | оставить как есть («не влезло» в живой день) |
+| `idc:<cand_id>:<person_id\|new\|skip>` | кандидат «Кто это?» |
+| `act:<id>:ok\|dr\|no\|fix\|bk:<h8>` | карточка действия, h8 = первые 8 hex shown_hash |
+
+## Люди и имена
+
+Имя разрешается одним механизмом `extract.people.NameIndex` (транслит, падежи, уменьшительные, пары
+«имя фамилия» в обоих порядках) и в сведении людей, и в извлечении обещаний
+(`extract.decisions.resolve_person`). Голое имя («Саша»), которое среди участников встречи носят двое,
+не разрешается никогда, даже если у одного из них это имя записано обличьем: принимается только одно
+упоминание ровно с одним кандидатом. Бот (`bot/candidates.py`), когда George выбрал существующего
+человека, не пишет голое имя обличьем на весь контекст, если в контексте его носит кто-то ещё
+(`people.shared_bare_name`): выбор тогда действует только на эту встречу (человек добавляется
+в `meta.participant_ids`), и карточка говорит об этом. «Новый человек» заводится с этим именем
+как display_name, так что его обличье ничего не добавляет и пишется как раньше.
+
+## Сбои модели: попытки
+
+Ни один элемент не крутится вечно и не держит очередь. Неудачная попытка пишется в meta события
+`{attempts, error, at}`: `meta.extract` (встреча), `meta.draft` (ответ), `meta.trello_draft` (карточки
+со встречи), `meta.triage_try` (триаж). Повтор не раньше `attempts * RETRY_HOURS` (1 час), свежие
+элементы в выборке идут первыми. После `MAX_ATTEMPTS = 3` элемент отмечается сделанным
+(`extract:<id>`, `draft:<id>`, `trello:<id>`, у триажа `triage.skipped='error'`) и в «Систему» уходит
+одно сообщение. Повторить встречу руками: удалить её отметку из work.notices.
 
 ## Коллекторы
 
@@ -128,7 +187,7 @@ context_id)`, класс `Collector(source_row)` с `collect() -> Iterable[Event
 | eas-watch        | collectors.eas:watch              | reader  | сервис (Ping) |
 | ingest           | collectors.ingest_server:serve    | reader  | сервис (tailnet) |
 | people           | extract.people:run                | reader  | каждые 15 мин |
-| embed            | agents.embed_backfill:run         | reader  | ночью |
+| embed [--max-minutes N] | agents.embed_backfill:run  | reader  | ночью, не дольше 40 минут |
 | extract          | extract.decisions:run             | reader  | каждые 15 мин |
 | triage           | extract.triage:run                | reader  | каждые 15 мин |
 | draft            | agents.drafter:run                | reader  | каждые 15 мин |
@@ -145,10 +204,19 @@ context_id)`, класс `Collector(source_row)` с `collect() -> Iterable[Event
 | garmin           | rpg.garmin:run                    | reader  | каждый час |
 | weekly           | rpg.weekly:run                    | reader  | вс 20:00 |
 | seed-grid FILE   | rpg.seed:run                      | admin   | вручную |
-| health           | health:run                        | reader  | каждые 15 мин |
+| health           | health:run                        | reader  | каждые 15 мин (источники, мини-приложение, бэкап) |
 
 Отдельные сервисы: `python -m bot.terminal` (bot), `python -m app.server` (app),
 `python -m executors queue` и `python -m executors calendar` (exec).
+
+Команды, которые зовут модель или грузят эмбеддинги (`workctl.LLM_LOCK`: plan, extract, triage, draft,
+review, classify, cards, weekly, embed), идут по одной через flock на `WORKOS_LLM_LOCK`
+(по умолчанию `/var/lib/workos-reader/llm.lock`; в `/tmp` нельзя, у юнитов PrivateTmp). Кто не дождался
+замка (4-15 минут, по команде), пропускает прогон с кодом 0. Бэкфилл эмбеддингов ограничен
+по времени и пишет usage_log по пачке; в systemd у него свой drop-in с MemoryMax.
+
+`retrieve` (тема «Спросить») по умолчанию ищет только полнотекстом: вектор включается явно
+`WORKOS_ASK_VECTOR=1` (модель ~400 МБ в процессе бота, на дроплете 1 ГБ это риск OOM).
 
 Предложить действие из любого читателя: `agents.autonomy.propose(conn, type, context_id, payload,
 rationale=None, source_event=None) -> action_id` — сама решает approval|auto и семплинг.
@@ -156,6 +224,6 @@ rationale=None, source_event=None) -> action_id` — сама решает appro
 
 ## Тесты
 
-`pytest -q` с локальным Postgres (`tests/conftest.py`): фикстуры `admin`, `as_role(role)`,
+`python3 -m pytest -q` с локальным Postgres (`tests/conftest.py`): фикстуры `admin`, `as_role(role)`,
 `role_env(role)` (модули под нужной ролью). Внешние API — через `httpx.MockTransport`;
 модель — через `core.llm.set_fake`.

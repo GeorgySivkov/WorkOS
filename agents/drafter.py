@@ -10,6 +10,11 @@
    если задан TRELLO_PROPOSE_LIST_ID (список, куда класть, обычно Backlog).
 
 Отправляет не драфтер: он только предлагает. Письмо исполнитель кладёт черновиком.
+
+Сбой модели не крутится вечно: попытки пишутся в meta.draft (ответы) и meta.trello_draft
+(карточки) как {attempts, error, at}, повтор не раньше чем через attempts часов, свежие
+элементы идут первыми. После MAX_ATTEMPTS элемент пропускается и в «Систему» уходит
+одно сообщение.
 """
 from __future__ import annotations
 
@@ -18,11 +23,13 @@ from datetime import date as _date
 
 from agents import autonomy
 from core import config, db, llm, timeutil as tu
+from extract.decisions import give_up_text
 from extract.triage import addr_list, is_mine, me_emails, sender
 
 STYLE_DIR = config.ROOT / "style"
 LIMIT = 10
 MAX_ATTEMPTS = 3
+RETRY_HOURS = 1      # пауза перед повтором после сбоя модели: attempts * RETRY_HOURS
 THREAD_N = 3
 MSG_CHARS = 8000
 RECENT_DAYS = 7
@@ -56,6 +63,17 @@ def load_style(context_id: str | None) -> tuple[str, str | None]:
 
 # ---------- ответы ----------
 
+def _attempts_sql(key: str) -> str:
+    return f"COALESCE((e.meta->'{key}'->>'attempts')::int, 0)"
+
+
+def _retry_due_sql(key: str) -> str:
+    """Элемент без сбоев или со сбоем, после которого прошла пауза attempts * RETRY_HOURS."""
+    n = _attempts_sql(key)
+    return (f"({n} = 0 OR COALESCE((e.meta->'{key}'->>'at')::timestamptz, '-infinity') "
+            f"<= now() - make_interval(hours => {n} * %(retry)s))")
+
+
 CANDIDATES = f"""
 SELECT e.id, e.context_id, e.source_id, e.external_id, e.kind, e.occurred_at, e.title, e.body, e.meta,
        e.actor_raw, e.actor_person_id, e.thread_key
@@ -64,11 +82,12 @@ WHERE e.kind IN ('email', 'message')
   AND e.meta->'triage'->>'needs_reply' = 'true'
   AND e.occurred_at > now() - interval '{RECENT_DAYS} days'
   AND (NOT (e.meta ? 'draft')
-       OR (e.meta->'draft' ? 'error' AND COALESCE((e.meta->'draft'->>'attempts')::int, 0) < {MAX_ATTEMPTS}))
+       OR (e.meta->'draft' ? 'error' AND {_attempts_sql('draft')} < {MAX_ATTEMPTS} AND {_retry_due_sql('draft')}))
   AND NOT EXISTS (SELECT 1 FROM work.actions a
                   WHERE a.source_event = e.id AND a.type IN ('email_reply', 'slack_post'))
-ORDER BY CASE e.meta->'triage'->>'urgency' WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, e.occurred_at
-LIMIT %s
+ORDER BY {_attempts_sql('draft')},
+         CASE e.meta->'triage'->>'urgency' WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, e.occurred_at
+LIMIT %(n)s
 """
 
 
@@ -199,10 +218,19 @@ def _mark(conn, event_id: int, info: dict) -> None:
                  (db.jb(info), event_id))
 
 
+def _give_up(conn, key: str, what: str, ev: dict, attempts: int, error: str) -> None:
+    """Одно сообщение в «Систему» на элемент, где модель сдалась (дедуп через work.notices)."""
+    if conn.execute("INSERT INTO work.notices (key) VALUES (%s) ON CONFLICT DO NOTHING RETURNING key",
+                    (key,)).fetchone():
+        title = ev.get("title") or nodash((ev.get("body") or "").strip()[:60]) or None
+        conn.execute("INSERT INTO work.outbox (topic, text) VALUES ('system', %s)",
+                     (give_up_text(what, title, ev.get("occurred_at"), attempts, error, key),))
+
+
 def draft_replies(conn, limit: int = LIMIT, dry_run: bool = False) -> dict:
     stamp = tu.now().isoformat(timespec="seconds")
     res = {"candidates": 0, "proposed": 0, "skipped": 0, "errors": 0, "styles": []}
-    rows = conn.execute(CANDIDATES, (limit,)).fetchall()
+    rows = conn.execute(CANDIDATES, {"n": limit, "retry": RETRY_HOURS}).fetchall()
     res["candidates"] = len(rows)
     for ev in rows:
         if answered_later(conn, ev):
@@ -235,7 +263,11 @@ def draft_replies(conn, limit: int = LIMIT, dry_run: bool = False) -> dict:
         except llm.LLMError as e:
             res["errors"] += 1
             if not dry_run:
-                _mark(conn, ev["id"], {"error": str(e)[:200], "attempts": attempts + 1, "at": stamp})
+                with conn.transaction():
+                    _mark(conn, ev["id"], {"error": str(e)[:200], "attempts": attempts + 1, "at": stamp})
+                    if attempts + 1 >= MAX_ATTEMPTS:
+                        _give_up(conn, f"draft:{ev['id']}", "Черновик ответа", ev, attempts + 1, str(e))
+                        res["gave_up"] = res.get("gave_up", 0) + 1
             continue
         body = nodash((out.get("body") or "").strip())
         if out.get("skip") or not body:
@@ -302,15 +334,16 @@ def card_payload(card: dict, list_id: str, allowed: list[str]) -> dict | None:
     return p
 
 
-TRELLO_CANDIDATES = """
-SELECT e.id, e.context_id, e.title, e.occurred_at, e.meta
+TRELLO_CANDIDATES = f"""
+SELECT e.id, e.context_id, e.title, e.occurred_at, e.meta, {_attempts_sql('trello_draft')} AS attempts
 FROM work.events e
 WHERE e.kind = 'meeting' AND e.context_id = 'infatica'
   AND jsonb_array_length(COALESCE(e.meta->'extract'->'tasks', '[]'::jsonb)) > 0
   AND e.occurred_at > now() - interval '14 days'
   AND NOT EXISTS (SELECT 1 FROM work.notices n WHERE n.key = 'trello:' || e.id)
-ORDER BY e.occurred_at
-LIMIT %s
+  AND {_retry_due_sql('trello_draft')}
+ORDER BY {_attempts_sql('trello_draft')}, e.occurred_at
+LIMIT %(n)s
 """
 
 
@@ -320,7 +353,7 @@ def propose_trello(conn, limit: int = 5, dry_run: bool = False) -> dict:
     if not list_id:
         return {**res, "disabled": "TRELLO_PROPOSE_LIST_ID не задан"}
     allowed = _labels_allowed()
-    for ev in conn.execute(TRELLO_CANDIDATES, (limit,)).fetchall():
+    for ev in conn.execute(TRELLO_CANDIDATES, {"n": limit, "retry": RETRY_HOURS}).fetchall():
         res["meetings"] += 1
         tasks = ev["meta"]["extract"]["tasks"]
         decisions = conn.execute("SELECT statement, rationale FROM work.decisions WHERE source_event = %s "
@@ -335,8 +368,19 @@ def propose_trello(conn, limit: int = 5, dry_run: bool = False) -> dict:
         try:
             out = llm.complete_json("drafter", TRELLO_SYSTEM, user)
             cards = out.get("cards", []) if isinstance(out, dict) else out
-        except llm.LLMError:
+            if not isinstance(cards, list):
+                raise llm.LLMError("в ответе нет списка cards")
+        except llm.LLMError as e:
             res["errors"] += 1
+            if not dry_run:
+                n = int(ev["attempts"] or 0) + 1
+                with conn.transaction():
+                    conn.execute("UPDATE work.events SET meta = meta || jsonb_build_object('trello_draft', %s::jsonb) "
+                                 "WHERE id = %s", (db.jb({"attempts": n, "error": str(e)[:200],
+                                                         "at": tu.now().isoformat(timespec="seconds")}), ev["id"]))
+                    if n >= MAX_ATTEMPTS:      # отметка trello:<id> снимает встречу с очереди
+                        _give_up(conn, f"trello:{ev['id']}", "Карточки Trello со встречи", ev, n, str(e))
+                        res["gave_up"] = res.get("gave_up", 0) + 1
             continue
         if dry_run:
             res["cards"] += len(cards or [])

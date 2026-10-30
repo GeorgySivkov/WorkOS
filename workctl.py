@@ -8,15 +8,24 @@
 
 .env выбирается по WORKOS_ROLE (это делает core.config). Модули импортируются лениво:
 команда, чей модуль ещё не написан, честно говорит об этом и не роняет остальные.
+
+Команды, которые зовут модель или грузят модель эмбеддингов (LLM_LOCK), идут по одной:
+каждый claude CLI это 150-250 МБ, а дроплет 1 ГБ. Замок flock на WORKOS_LLM_LOCK
+(по умолчанию /var/lib/workos-reader/llm.lock: /tmp у юнитов свой, PrivateTmp).
+Не дождался замка за отведённое время: прогон пропускается (код 0), следующий таймер
+попробует снова. Каталога замка нет (Мак, тесты): работаем без замка.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import importlib
 import inspect
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -49,6 +58,44 @@ COMMANDS = {
     "seed-grid": ("rpg.seed:run", "admin"),
     "health": ("health:run", "reader"),
 }
+
+# команда -> сколько секунд ждать замка модели, потом пропустить прогон
+LLM_LOCK = {
+    "plan": 900, "review": 900, "weekly": 900,       # редкие: ждём дольше
+    "extract": 600, "triage": 600, "draft": 600, "embed": 600,
+    "classify": 240, "cards": 240,                   # каждые 5 минут: следующий скоро
+}
+LOCK_DEFAULT = "/var/lib/workos-reader/llm.lock"
+
+
+class Busy(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def llm_lock(cmd: str, path: str | None = None, wait: float | None = None):
+    """flock на время команды. Нет каталога или прав на него: без замка (Мак, тесты)."""
+    path = path or os.environ.get("WORKOS_LLM_LOCK") or LOCK_DEFAULT
+    wait = LLM_LOCK.get(cmd, 600) if wait is None else wait
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        yield False
+        return
+    try:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise Busy(f"модель занята дольше {int(wait)} с") from None
+                time.sleep(min(2.0, max(0.05, deadline - time.monotonic())))
+        yield True
+    finally:
+        os.close(fd)          # закрытие снимает flock
+
 
 HELP = {
     "collect": "коллекторы: все включённые, по виду (--kind) или один источник (--source)",
@@ -130,12 +177,24 @@ def cmd_task(args) -> int:
             kwargs["kind"] = args.kind
     elif args.cmd in ("garmin", "embed") and args.days:
         kwargs["days"] = args.days
+    elif args.cmd == "embed" and getattr(args, "max_minutes", None):
+        kwargs["max_minutes"] = args.max_minutes
     try:
         fn = resolve(target)
     except Missing as e:
         print(f"{args.cmd}: {e}", file=sys.stderr)
         return 3
-    show(call(fn, kwargs))
+    if args.cmd not in LLM_LOCK:
+        res = call(fn, kwargs)
+        show(res)
+        if args.cmd == "eas-watch" and isinstance(res, dict) and res.get("status") in ("fatal", "disabled", "config"):
+            return 3      # как у python -m collectors.eas --watch: systemd не перезапускает
+        return 0
+    try:
+        with llm_lock(args.cmd):
+            show(call(fn, kwargs))
+    except Busy as e:
+        print(f"{args.cmd}: пропускаю прогон, {e}", file=sys.stderr)
     return 0
 
 
@@ -213,6 +272,8 @@ EXPECT = {
         (T, "rpg.xp", "INSERT", True), (T, "rpg.cells", "INSERT", False),
         (T, "rpg.level_marks", "UPDATE", True), (T, "rpg.achievements", "INSERT", True),
         (F, "rpg.award_task(bigint)", "EXECUTE", True), (F, "rpg.log_manual(text)", "EXECUTE", False),
+        (T, "work.autonomy", "INSERT", False), (C, "work.autonomy.mode", "UPDATE", False),
+        (F, "work.autonomy_recompute(boolean)", "EXECUTE", True),
     ],
     "workos_bot": [
         (T, "work.events", "SELECT", True), (T, "work.actions", "INSERT", True),
@@ -222,6 +283,7 @@ EXPECT = {
         (T, "work.tasks", "INSERT", True), (C, "work.tasks.due", "UPDATE", True),
         (C, "work.tasks.planned_start", "UPDATE", True),
         (T, "rpg.xp", "INSERT", False), (T, "work.calendar_feed", "SELECT", True),
+        (C, "work.actions.shown_hash", "UPDATE", True), (C, "work.autonomy.auto_count", "UPDATE", True),
     ],
     "workos_exec": [
         (T, "work.events", "SELECT", False), (T, "work.calendar_feed", "SELECT", True),
@@ -229,7 +291,7 @@ EXPECT = {
         (C, "work.actions.approved_hash", "UPDATE", False), (C, "work.actions.payload", "UPDATE", False),
         (T, "work.outbox", "INSERT", True), (C, "work.tasks.planned_start", "UPDATE", True),
         (C, "work.tasks.block_synced_at", "UPDATE", True), (C, "work.tasks.title", "UPDATE", False),
-        (T, "work.outcomes", "INSERT", False),
+        (T, "work.outcomes", "INSERT", False), (C, "work.actions.shown_hash", "UPDATE", False),
     ],
     "workos_app": [
         (T, "work.tasks", "SELECT", True), (T, "work.tasks", "INSERT", True),
@@ -238,6 +300,7 @@ EXPECT = {
         (T, "work.events", "SELECT", False), (T, "work.actions", "SELECT", False),
         (T, "work.outbox", "SELECT", False), (T, "rpg.xp", "INSERT", False),
         (F, "rpg.log_manual(text)", "EXECUTE", True), (F, "rpg.award_task(bigint)", "EXECUTE", True),
+        (F, "rpg.app_level_up(integer,integer)", "EXECUTE", True),
     ],
 }
 
@@ -299,6 +362,8 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--since", help="YYYY-MM-DD")
         if name in ("garmin", "embed"):
             sp.add_argument("--days", type=int)
+        if name == "embed":
+            sp.add_argument("--max-minutes", type=float, help="потолок времени прогона (по умолчанию 40)")
         sp.set_defaults(func=cmd_task)
     return p
 

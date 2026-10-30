@@ -1,9 +1,10 @@
 """Коллектор Plaud (шаг 2.3): записи встреч с готовым транскриптом.
 
 Событие появляется, только когда транскрипт готов. Каждый прогон
-перечитывает записи за lookback_days (по времени начала записи), так
-транскрипт, дозревший к утру, подтягивается сам: body у события пуст до
-этого момента просто потому, что события ещё нет.
+перечитывает записи за lookback_days (по времени начала записи). Запись без
+транскрипта запоминается в state.pending и перепроверяется каждый прогон до
+30 дней, а запись, загруженная с телефона поздно (старая по времени, но новая
+для нас), тоже подхватывается: см. collect().
 
 Встреча сопоставляется с календарём: событие из work.calendar_feed,
 пересекающееся с записью (±15 минут), даёт calendar_event_id и контекст.
@@ -17,7 +18,7 @@ API: неофициальный веб-API Plaud (как в github.com/arbuzmell
 слова bearer), PLAUD_API_BASE (по умолчанию https://api.plaud.ai; для
 европейского аккаунта может понадобиться региональный хост).
 Настройки источника: {"token_env": "PLAUD_TOKEN", "base_env": "PLAUD_API_BASE",
-"match_minutes": 15, "page_size": 50}.
+"match_minutes": 15, "page_size": 50, "pending_days": 30}.
 """
 from __future__ import annotations
 
@@ -32,6 +33,19 @@ from collectors.base import Collector, Event, run_enabled
 from core import config, db, timeutil as tu
 
 UTC = timezone.utc
+PENDING_DAYS = 30        # столько ждём транскрипт записи, потом забываем
+MAX_PAGES = 20           # страниц списка за прогон
+DEEP_SCAN_MINUTES = 60   # как часто листать список до конца срока ожидания
+
+
+def _parse_iso(s) -> datetime | None:
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 class PlaudError(RuntimeError):
@@ -200,47 +214,95 @@ class PlaudCollector(Collector):
         base = config.env(self.cfg.get("base_env") or "PLAUD_API_BASE", "https://api.plaud.ai")
         return PlaudAPI(token, base, transport=self.transport)
 
+    def _known(self, conn, ids: list[str]) -> set[str]:
+        if not ids:
+            return set()
+        return {r["external_id"] for r in conn.execute(
+            "SELECT external_id FROM work.events WHERE source_id = %s AND external_id = ANY(%s)",
+            (self.source_id, ids)).fetchall()}
+
     def collect(self) -> Iterable[Event]:
+        """Список от новых к старым. Запись, у которой ещё нет транскрипта, попадает в
+        state.pending и перепроверяется через get_details каждый прогон, пока не
+        дозреет или не станет старше pending_days (30). Запись старше метки, которой
+        нет ни в базе, ни в pending, значит загружена поздно: её тоже берём.
+
+        Обычный прогон листает, пока не встретит страницу, где всё старше метки и
+        уже учтено (в базе или в pending). Поздняя загрузка может прятаться за такой
+        страницей, поэтому не реже раза в deep_scan_minutes (60) прогон листает
+        глубоко: до страницы, где всё старше 30 дней (state.scanned_at).
+        state.floor = метка первого прогона: что записано раньше, до WorkOS, не тянем."""
         started = tu.now()
         cutoff = self.since(default_days=max(self.lookback.days, 3))
+        st = self.state if isinstance(self.state, dict) else {}
+        horizon = started - timedelta(days=int(self.cfg.get("pending_days") or PENDING_DAYS))
+        floor = _parse_iso(st.get("floor")) or cutoff
+        lower = max(floor, horizon)
+        pending: dict[str, str] = {}
+        for fid, iso in (st.get("pending") or {}).items():
+            when = _parse_iso(iso)
+            if when is None or when >= horizon:
+                pending[str(fid)] = iso
+        scanned = _parse_iso(st.get("scanned_at"))
+        deep = scanned is None or started - scanned >= timedelta(
+            minutes=int(self.cfg.get("deep_scan_minutes", DEEP_SCAN_MINUTES)))
         api = self.api()
         page = int(self.cfg.get("page_size") or 50)
-        ready: list[dict] = []
-        skip = 0
-        while True:
-            batch = api.list_recordings(skip=skip, limit=page)
-            if not batch:
-                break
-            stop = False
-            for rec in batch:
-                st = api.started_at(rec)
-                if st is not None and st < cutoff:
-                    stop = True
-                    break
-                if api.transcript_ready(rec):
-                    ready.append(rec)
-            if stop or len(batch) < page:
-                break
-            skip += page
-
         events: list[Event] = []
-        if ready:
-            pad = int(self.cfg.get("match_minutes") or 15)
-            details: dict[str, dict] = {}
-            ids = [api.file_id(r) for r in ready]
-            for i in range(0, len(ids), 20):
-                for d in api.get_details(ids[i:i + 20]):
-                    details[api.file_id(d)] = d
-            with db.connect() as conn:
-                known = {r["external_id"] for r in conn.execute(
-                    "SELECT external_id FROM work.events WHERE source_id = %s AND external_id = ANY(%s)",
-                    (self.source_id, ids)).fetchall()}
-                for rec in ready:
+        with db.connect() as conn:
+            candidates: dict[str, dict] = {}        # транскрипт по списку готов: за деталями
+            not_ready: set[str] = set()              # список прямо сейчас говорит «ещё нет»
+            recheck = set(pending)                   # ждали с прошлых прогонов
+            skip = pages = 0
+            while True:
+                batch = api.list_recordings(skip=skip, limit=page)
+                if not batch:
+                    break
+                known = self._known(conn, [api.file_id(r) for r in batch])
+                settled = True                      # вся страница старше метки и уже учтена
+                beyond = True                       # вся страница старше нижней границы
+                for rec in batch:
                     fid = api.file_id(rec)
-                    ev = self._event(api, conn, {**rec, **details.get(fid, {})}, pad, fid in known)
+                    when = api.started_at(rec)
+                    if when is None or when >= lower:
+                        beyond = False
+                    if when is None or when >= cutoff:
+                        settled = False             # свежая: перечитываем всегда (сводка дозревает)
+                    elif when < lower or fid in known or fid in pending:
+                        continue                    # старое и уже учтённое (pending проверим ниже)
+                    else:
+                        settled = False             # поздняя загрузка: старая по времени, но новая
+                    if api.transcript_ready(rec):
+                        candidates[fid] = rec
+                    elif fid not in known:
+                        not_ready.add(fid)
+                        pending.setdefault(fid, (when or started).isoformat())
+                pages += 1
+                if (beyond or (settled and not deep)) or len(batch) < page or pages >= MAX_PAGES:
+                    break
+                skip += page
+
+            ids = list(dict.fromkeys([*candidates, *(p for p in pending if p in recheck and p not in not_ready)]))
+            if ids:
+                pad = int(self.cfg.get("match_minutes") or 15)
+                details: dict[str, dict] = {}
+                for i in range(0, len(ids), 20):
+                    for d in api.get_details(ids[i:i + 20]):
+                        details[api.file_id(d)] = d
+                known = self._known(conn, ids)
+                for fid in ids:
+                    rec = {**candidates.get(fid, {}), **details.get(fid, {})}
+                    if not rec:
+                        continue                    # Plaud о записи молчит: подождём, срок ограничен
+                    ev = self._event(api, conn, rec, pad, fid in known)
                     if ev:
                         events.append(ev)
-        self.state = {"cursor": started.isoformat()}
+                        pending.pop(fid, None)
+                    elif fid not in known:
+                        when = api.started_at(rec)
+                        pending.setdefault(fid, (when or started).isoformat())
+        self.state = {"cursor": started.isoformat(), "floor": floor.isoformat(), "pending": pending,
+                      "scanned_at": started.isoformat() if deep else (scanned or started).isoformat()}
         return events
 
     def _event(self, api: PlaudAPI, conn, rec: dict, pad: int, known: bool = False) -> Event | None:

@@ -12,6 +12,12 @@
            «канал:ts»), thread_ts, is_reply, user, is_dm, mention / mentions_me, from_me
 Своё («от меня») определяется по meta.from_me/is_me/outgoing, адресам из
 WORKOS_SELF_EMAILS, Slack id из WORKOS_SELF_HANDLES или WORKOS_ME_PERSON_ID.
+
+Сбой модели на пачке не крутится вечно: каждому элементу пачки пишется
+meta.triage_try {attempts, error, at}, повтор не раньше чем через attempts часов,
+свежие элементы идут первыми. После MAX_ATTEMPTS элемент получает triage с
+skipped='error' (ответа по нему драфтер не предложит), а в «Систему» уходит одно
+сообщение за прогон.
 """
 from __future__ import annotations
 
@@ -20,8 +26,11 @@ from datetime import date
 from email.utils import getaddresses, parseaddr
 
 from core import config, db, llm, timeutil as tu
+from core.tg import esc
 
 BATCH = 20
+MAX_ATTEMPTS = 3
+RETRY_HOURS = 1
 BODY_CHARS = 1500
 URGENCY = {"low", "normal", "high"}
 
@@ -179,27 +188,31 @@ def triage_batch(events: list[dict]) -> dict[int, dict]:
     return out
 
 
-SELECT = """
+_ATTEMPTS = "COALESCE((e.meta->'triage_try'->>'attempts')::int, 0)"
+SELECT = f"""
 SELECT e.id, e.context_id, e.source_id, e.kind, e.occurred_at, e.title, e.body, e.meta,
-       e.actor_raw, e.actor_person_id, e.thread_key
+       e.actor_raw, e.actor_person_id, e.thread_key, {_ATTEMPTS} AS attempts
 FROM work.events e
 WHERE e.kind IN ('email', 'message')
   AND NOT (e.meta ? 'triage')
   AND e.source_id NOT LIKE 'telegram%%'
-ORDER BY e.occurred_at
-LIMIT %s
+  AND ({_ATTEMPTS} = 0
+       OR COALESCE((e.meta->'triage_try'->>'at')::timestamptz, '-infinity')
+          <= now() - make_interval(hours => {_ATTEMPTS} * %(retry)s))
+ORDER BY {_ATTEMPTS}, e.occurred_at
+LIMIT %(n)s
 """
 
 
-def _mark(conn, event_id: int, tri: dict) -> None:
-    conn.execute("UPDATE work.events SET meta = meta || jsonb_build_object('triage', %s::jsonb) WHERE id = %s",
+def _mark(conn, event_id: int, tri: dict, key: str = "triage") -> None:
+    conn.execute(f"UPDATE work.events SET meta = meta || jsonb_build_object('{key}', %s::jsonb) WHERE id = %s",
                  (db.jb(tri), event_id))
 
 
 def run(date: str | None = None, dry_run: bool = False, limit: int = 200, **kw) -> dict:
     stamp = tu.now().isoformat(timespec="seconds")
     with db.connect() as conn:
-        rows = conn.execute(SELECT, (limit,)).fetchall()
+        rows = conn.execute(SELECT, {"n": limit, "retry": RETRY_HOURS}).fetchall()
     skipped, todo = [], []
     for ev in rows:
         if is_mine(ev):
@@ -209,13 +222,17 @@ def run(date: str | None = None, dry_run: bool = False, limit: int = 200, **kw) 
         else:
             todo.append(ev)
     results: dict[int, dict] = {}
+    failed: dict[int, tuple[int, str]] = {}          # id -> (попытка, ошибка)
     errors = 0
     for i in range(0, len(todo), BATCH):
         chunk = todo[i:i + BATCH]
         try:
             results.update(triage_batch(chunk))
-        except llm.LLMError:
+        except llm.LLMError as e:
             errors += 1
+            for ev in chunk:
+                failed[ev["id"]] = (int(ev.get("attempts") or 0) + 1, str(e)[:200])
+    gave_up = [eid for eid, (n, _) in failed.items() if n >= MAX_ATTEMPTS]
     if not dry_run:
         with db.connect() as conn, conn.transaction():
             for eid, why in skipped:
@@ -223,9 +240,20 @@ def run(date: str | None = None, dry_run: bool = False, limit: int = 200, **kw) 
                                   "thread": None, "summary": "", "skipped": why, "at": stamp})
             for eid, tri in results.items():
                 _mark(conn, eid, {**tri, "at": stamp})
+            for eid, (n, err) in failed.items():
+                _mark(conn, eid, {"attempts": n, "error": err, "at": stamp}, "triage_try")
+                if n >= MAX_ATTEMPTS:
+                    _mark(conn, eid, {"needs_reply": False, "urgency": "low", "deadline": None,
+                                      "thread": None, "summary": "", "skipped": "error", "at": stamp})
+            if gave_up:
+                err = next(err for eid, (_, err) in failed.items() if eid in gave_up)
+                conn.execute("INSERT INTO work.outbox (topic, text) VALUES ('system', %s)", (
+                    f"⚠ <b>Триаж</b>: {len(gave_up)} входящих модель не разобрала за {MAX_ATTEMPTS} попытки, "
+                    f"пропускаю их (черновиков ответа по ним не будет). Ошибка: <code>{esc(err)}</code>",))
     return {"seen": len(rows), "triaged": len(results), "skipped": len(skipped),
             "needs_reply": sum(1 for t in results.values() if t["needs_reply"]),
-            "batches": (len(todo) + BATCH - 1) // BATCH, "errors": errors, "dry_run": dry_run}
+            "batches": (len(todo) + BATCH - 1) // BATCH, "errors": errors, "gave_up": len(gave_up),
+            "dry_run": dry_run}
 
 
 if __name__ == "__main__":

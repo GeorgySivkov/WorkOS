@@ -56,6 +56,49 @@ def test_health_app_down_once(admin, role_env):
     assert health.run(transport=ok_app())["recovered"] == ["Мини-приложение"]
 
 
+def test_health_backup_alert_only_when_backups_enabled(admin, role_env):
+    import health
+    role_env("workos_reader")
+    r = health.run(transport=ok_app())
+    assert "Бэкап базы" not in r["alerts"] and r["ok"] == 1          # отметок нет: бэкап не включён, молчим
+    admin.execute("INSERT INTO work.notices (key, sent_at) VALUES ('backup:2026-10-01', now() - interval '30 hours')")
+    r = health.run(transport=ok_app())
+    assert r["alerts"] == ["Бэкап базы"]
+    text = outbox(admin)[-1]
+    assert "последний удачный бэкап 30 ч назад" in text and "workos-backup" in text and "—" not in text
+    assert health.run(transport=ok_app())["alerts"] == []             # один алерт на инцидент
+    admin.execute("INSERT INTO work.notices (key) VALUES ('backup:2026-10-02')")      # свежий бэкап
+    assert health.run(transport=ok_app())["recovered"] == ["Бэкап базы"]
+    assert len(outbox(admin)) == 2 and "восстановился" in outbox(admin)[-1]
+
+
+def test_workctl_llm_lock_serializes_and_skips(tmp_path, monkeypatch, capsys):
+    import fcntl
+    import os
+    lock = tmp_path / "llm.lock"
+    with workctl.llm_lock("extract", str(lock), wait=0) as held:
+        assert held
+        with pytest.raises(workctl.Busy):
+            with workctl.llm_lock("extract", str(lock), wait=0.1):
+                pass
+    with workctl.llm_lock("extract", str(tmp_path / "нет" / "llm.lock"), wait=0) as held:
+        assert held is False                                        # нет каталога: без замка
+    # команда с моделью при занятом замке пропускает прогон с кодом 0 и модуль не зовёт
+    monkeypatch.setenv("WORKOS_LLM_LOCK", str(lock))
+    monkeypatch.setitem(workctl.LLM_LOCK, "extract", 0.1)
+    called = []
+    monkeypatch.setattr(workctl, "resolve", lambda target: lambda **kw: called.append(kw))
+    fd = os.open(lock, os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        assert workctl.main(["extract"]) == 0
+    finally:
+        os.close(fd)
+    assert not called and "пропускаю прогон" in capsys.readouterr().err
+    assert workctl.main(["extract"]) == 0 and called == [{}]
+    assert workctl.main(["embed", "--max-minutes", "5"]) == 0 and called[-1] == {"max_minutes": 5.0}
+
+
 def test_workctl_status_and_missing_module(admin, role_env, capsys):
     role_env("workos_reader")
     assert workctl.main(["status"]) == 0

@@ -419,7 +419,9 @@ def test_full_pass_provision_folders_mail_calendar_idempotent(admin, role_env):
     mail = rows(admin, "email")
     assert len(mail) == 1
     m = mail[0]
-    assert m["external_id"] == "mail:5:1" and m["context_id"] == "alfa"
+    assert m["external_id"] == eas.mail_external_id(mail_item()) and m["context_id"] == "alfa"
+    assert m["external_id"].startswith("mail:") and "5:1" not in m["external_id"]
+    assert m["meta"]["server_id"] == "5:1" and m["meta"]["sync_epoch"] == 1 and m["meta"]["removed"] is False
     assert m["title"] == "Часы поддержки: методика"
     assert m["body"] == "Коллеги,\nпредлагаю обсудить методику."
     assert m["occurred_at"] == datetime(2026, 10, 19, 7, 15, tzinfo=UTC)
@@ -525,6 +527,187 @@ def test_changed_master_cancels_vanished_instance(admin, role_env):
     assert weekly["2026-11-24T09:00:00+00:00"]["meta"]["status"] == "confirmed"
 
 
+def _answer(server, key: str, tree: Node) -> None:
+    """Разово ответить на Sync с этим SyncKey заранее собранным деревом."""
+    orig_sync = server.sync
+
+    def sync(t):
+        if t.find("Collections/Collection").text("SyncKey") == key:
+            server.sync = orig_sync
+            return _resp(tree)
+        return orig_sync(t)
+    server.sync = sync
+
+
+def _single(start: str, end: str, **extra) -> Node:
+    item = single_item()
+    for n in item.children:
+        if n.tag == "Calendar:StartTime":
+            n.value = start
+        elif n.tag == "Calendar:EndTime":
+            n.value = end
+    item.children += [el(k, v) for k, v in extra.items()]
+    return item
+
+
+def feed(admin, uid: str) -> list[dict]:
+    return admin.execute("SELECT * FROM work.calendar_feed WHERE source_id = 'eas:alfa' AND uid = %s "
+                         "ORDER BY starts_at", (uid,)).fetchall()
+
+
+def test_one_off_moved_outside_window_moves_row(admin, role_env):
+    """Разовую встречу перенесли за окно -7/+60: строка едет следом, призрака в окне нет."""
+    role_env("workos_reader")
+    server = FakeExchange()
+    collect(admin, server)
+    far = "20270201T130000Z"                                    # за пределами окна (до 19.12)
+    _answer(server, "C3", sync_response("6", "C4", changes=[("6:2", _single(far, "20270201T140000Z"))]))
+    res, col = collect(admin, server)
+    assert res["inserted"] == 0 and "single-1|" in col._moved_out
+    row = [r for r in rows(admin, "calendar") if r["meta"]["uid"] == "single-1"]
+    assert len(row) == 1
+    assert row[0]["occurred_at"] == datetime(2027, 2, 1, 13, tzinfo=UTC)
+    assert row[0]["meta"]["status"] == "confirmed" and row[0]["meta"]["ends_at"] == "2027-02-01T14:00:00+00:00"
+    # в окне встречи больше нет: ни занятого слота, ни копии в зеркале
+    win = admin.execute("SELECT count(*) AS n FROM work.calendar_feed WHERE uid = 'single-1' "
+                        "AND starts_at < %s", (NOW + timedelta(days=60),)).fetchone()["n"]
+    assert win == 0
+    # повтор ничего не меняет, а возврат в окно снова двигает ту же строку
+    res, _ = collect(admin, server)
+    assert res["updated"] == 0
+    _answer(server, "C4", sync_response("6", "C5", changes=[("6:2", _single("20261023T090000Z",
+                                                                             "20261023T100000Z"))]))
+    collect(admin, server)
+    row = [r for r in rows(admin, "calendar") if r["meta"]["uid"] == "single-1"]
+    assert len(row) == 1 and row[0]["occurred_at"] == datetime(2026, 10, 23, 9, tzinfo=UTC)
+
+
+def test_one_off_moved_far_into_past_and_shortened_series(admin, role_env):
+    """Встречу унесли в далёкое прошлое (мастер устарел), серию оборвали: в окне ничего не остаётся."""
+    role_env("workos_reader")
+    server = FakeExchange()
+    collect(admin, server)
+    weekly = weekly_item()
+    rec = weekly.find("Calendar:Recurrence")
+    rec.children.append(el("Calendar:Until", "20261001T080000Z"))       # серия кончилась до окна
+    _answer(server, "C3", sync_response("6", "C4", changes=[
+        ("6:2", _single("20260901T130000Z", "20260901T140000Z")), ("6:1", weekly)]))
+    collect(admin, server)
+    single = [r for r in rows(admin, "calendar") if r["meta"]["uid"] == "single-1"][0]
+    assert single["occurred_at"] == datetime(2026, 9, 1, 13, tzinfo=UTC)
+    assert all(r["meta"]["status"] == "cancelled" for r in rows(admin, "calendar")
+               if r["meta"]["uid"].endswith("-weekly") and r["occurred_at"] >= NOW - timedelta(days=7))
+    assert state(admin)["cal_masters"] == {}
+
+
+def test_exception_moved_out_of_window_is_not_left_behind(admin, role_env):
+    """Вхождение 22.12 (за окном) перенесли в окно на 01.12, потом обратно за окно на 29.12."""
+    role_env("workos_reader")
+    server = FakeExchange()
+    collect(admin, server)
+
+    def with_exception(start: str, end: str) -> Node:
+        item = weekly_item()
+        item.find("Calendar:Exceptions").children.append(
+            el("Calendar:Exception", el("Calendar:Subject", "Ретро (из декабря)"),
+               el("Calendar:StartTime", start), el("Calendar:EndTime", end),
+               el("Calendar:ExceptionStartTime", "20261222T090000Z")))
+        return item
+
+    _answer(server, "C3", sync_response("6", "C4", changes=[("6:1", with_exception("20261201T120000Z",
+                                                                                  "20261201T130000Z"))]))
+    collect(admin, server)
+    ext = "040000008200E00074C5B7101A82E008-weekly|2026-12-22T09:00:00+00:00"
+    moved = [r for r in rows(admin, "calendar") if r["external_id"] == ext]
+    assert len(moved) == 1 and moved[0]["occurred_at"] == datetime(2026, 12, 1, 12, tzinfo=UTC)
+    _answer(server, "C4", sync_response("6", "C5", changes=[("6:1", with_exception("20261229T120000Z",
+                                                                                  "20261229T130000Z"))]))
+    collect(admin, server)
+    moved = [r for r in rows(admin, "calendar") if r["external_id"] == ext][0]
+    assert moved["occurred_at"] == datetime(2026, 12, 29, 12, tzinfo=UTC)
+    assert moved["meta"]["status"] == "confirmed"
+    in_window = admin.execute("SELECT count(*) AS n FROM work.calendar_feed WHERE source_id = 'eas:alfa' "
+                              "AND starts_at = '2026-12-01T12:00:00Z'").fetchone()["n"]
+    assert in_window == 0
+
+
+def test_all_day_event_keeps_its_date(admin, role_env):
+    """Весь день по Москве (полночь МСК = 21:00Z накануне): дата та же, хранится полночь по Мадриду."""
+    from executors.calendar import mirror_body
+    role_env("workos_reader")
+    server = FakeExchange()
+    collect(admin, server)
+    allday = _single("20261024T210000Z", "20261025T210000Z")
+    allday.find("Calendar:AllDayEvent").value = "1"
+    allday.find("Calendar:UID").value = "allday-1"
+    _answer(server, "C3", sync_response("6", "C4", adds=[("6:9", allday)]))
+    collect(admin, server)
+    row = feed(admin, "allday-1")[0]
+    madrid = ZoneInfo("Europe/Madrid")
+    assert row["all_day"] is True
+    assert row["starts_at"] == datetime(2026, 10, 25, 0, tzinfo=madrid)
+    assert row["ends_at"] == datetime(2026, 10, 26, 0, tzinfo=madrid)
+    body = mirror_body(row)
+    assert body["start"] == {"date": "2026-10-25"} and body["end"] == {"date": "2026-10-26"}
+    # пояс без правил и сдвиг в пару часов: дата всё равно по ближайшей полуночи
+    m = {"tz": eas.make_timezone_blob(-120)}
+    s, e = eas._all_day_span(m, datetime(2026, 10, 24, 22, tzinfo=UTC), datetime(2026, 10, 25, 22, tzinfo=UTC))
+    assert s.astimezone(madrid).date() == date(2026, 10, 25) and e.astimezone(madrid).date() == date(2026, 10, 26)
+
+
+def test_mail_id_survives_server_id_change_and_flags_follow(admin, role_env):
+    """Сброс SyncKey раздаёт ServerId заново: письмо не задваивается, флаги ищутся по новому адресу,
+    старый адрес из прошлого состояния синхронизации чужие письма не задевает."""
+    role_env("workos_reader")
+    server = FakeExchange()
+    collect(admin, server)
+    first = rows(admin, "email")[0]
+    # сброс ключа «Входящих»: после него то же письмо приходит как 5:7
+    server.invalid_keys.add("M2")
+    orig_sync = server.sync
+
+    def sync(t):
+        col = t.find("Collections/Collection")
+        if col.text("CollectionId") == "5" and col.text("SyncKey") == "M1":
+            return _resp(sync_response("5", "M2", adds=[("5:7", mail_item())]))
+        return orig_sync(t)
+    server.sync = sync
+    res, _ = collect(admin, server)
+    mail = rows(admin, "email")
+    assert len(mail) == 1 and mail[0]["external_id"] == first["external_id"] and res["inserted"] == 0
+    assert mail[0]["meta"]["server_id"] == "5:7" and mail[0]["meta"]["sync_epoch"] == 2
+    # Change по старому адресу 5:1 (прошлая эпоха) ничего не трогает, по новому 5:7 ставит «прочитано»
+    server.sync = orig_sync
+    server.mail_changes["M2"] = ("M3", [("5:1", el("AirSync:ApplicationData", el("Email:Read", 1)))], [])
+    collect(admin, server)
+    assert rows(admin, "email")[0]["meta"]["read"] is False
+    server.mail_changes["M3"] = ("M4", [("5:7", el("AirSync:ApplicationData", el("Email:Read", 1)))], [])
+    collect(admin, server)
+    assert rows(admin, "email")[0]["meta"]["read"] is True
+    # письмо унесли из «Входящих» и вернули: та же строка, removed снова false
+    server.mail_changes["M4"] = ("M5", [], ["5:7"])
+    collect(admin, server)
+    assert rows(admin, "email")[0]["meta"]["removed"] is True
+    server.mail_changes["M5"] = ("M6", [("5:12", mail_item())], [])
+    collect(admin, server)
+    mail = rows(admin, "email")
+    assert len(mail) == 1 and mail[0]["meta"]["removed"] is False and mail[0]["meta"]["server_id"] == "5:12"
+
+
+def test_legacy_mail_row_still_gets_flags(admin, role_env):
+    """Строка старого формата (mail:<ServerId>, без эпохи) получает флаги по meta.server_id."""
+    role_env("workos_reader")
+    admin.execute("INSERT INTO work.events (context_id, source_id, external_id, kind, occurred_at, title, meta) "
+                  "VALUES ('alfa', 'eas:alfa', 'mail:5:3', 'email', now(), 'старое', %s)",
+                  (json.dumps({"server_id": "5:3", "read": False}),))
+    col = eas.EASCollector(source(admin), client=make_client(FakeExchange()), now=NOW)
+    col._mail_patches[("5:3", 0)] = {"read": True}
+    from core import db as cdb
+    with cdb.connect() as conn, conn.transaction():
+        col.finalize(conn, set())
+    assert rows(admin, "email")[0]["meta"]["read"] is True
+
+
 def test_reprovision_on_449_and_status_144():
     for mode in ("449", "144"):
         server = FakeExchange()
@@ -624,6 +807,22 @@ def test_ping_and_watch(admin, role_env):
     assert len(rows(admin)) == 10
     admin.execute("UPDATE work.sources SET enabled = false WHERE id = 'eas:alfa'")
     assert eas.watch(client=make_client(server))["status"] == "disabled"
+
+
+def test_watch_exits_3_when_disabled_or_not_configured(admin, role_env, monkeypatch, caplog):
+    """systemd: Restart=always + RestartPreventExitStatus=3. Выключенный источник и пустой
+    .env.reader не должны перезапускать сервис каждые 10 секунд."""
+    role_env("workos_reader")
+    admin.execute("UPDATE work.sources SET enabled = false WHERE id = 'eas:alfa'")
+    assert eas.main(["--watch"]) == 3
+    assert any("выключен" in r.getMessage() and "код" in r.getMessage() for r in caplog.records)
+    admin.execute("UPDATE work.sources SET enabled = true WHERE id = 'eas:alfa'")
+    for k in ("ALFA_EAS_USER", "ALFA_EAS_PASSWORD", "ALFA_EAS_DEVICE_ID"):
+        monkeypatch.delenv(k, raising=False)
+    caplog.clear()
+    assert eas.main(["--watch"]) == 3
+    assert any("ALFA_EAS_USER" in r.getMessage() for r in caplog.records)
+    admin.execute("UPDATE work.sources SET enabled = false WHERE id = 'eas:alfa'")
 
 
 def test_probe_writes_nothing(admin):

@@ -5,13 +5,20 @@ channels:history, groups:history, search:read, users:read.
 
 Настройки источника (work.sources.config):
   {"token_env": "SLACK_TOKEN", "channels": ["C0123", "G0456"], "user_id": "U0789",
-   "thread_days": 7, "initial_days": 7, "mentions": true, "resolve_names": true}
+   "thread_days": 7, "initial_days": 7, "mentions": true, "resolve_names": true,
+   "search_threads": true}
 
 Водяная метка: ts последнего сообщения на канал (state.channels), каждый
 прогон перекрывает lookback_days назад. Треды, в которых что-то было
 за последние thread_days, перечитываются каждый прогон: ответы в старый
-тред conversations.history не покажет. Упоминания ищутся search.messages
-по «<@user_id>» во всех каналах, их треды подтягиваются целиком.
+тред conversations.history не покажет. Тред, молчавший дольше thread_days и
+вдруг оживший, находит поиск search.messages «in:<#C> after:<дата>» по своим
+каналам (нужен search:read; без него этот шаг тихо пропускается). Упоминания
+ищутся search.messages по «<@user_id>» во всех каналах, их треды подтягиваются
+целиком.
+
+Правка сообщения: body события не переписывается (правило коллекторов), поэтому
+текущий текст отредактированного сообщения кладётся в meta.text.
 """
 from __future__ import annotations
 
@@ -126,11 +133,28 @@ class SlackCollector(Collector):
             "mentions_me": bool(me and f"<@{me}>" in text), "from_me": bool(me and m.get("user") == me),
             "edited": bool(m.get("edited")),
         }
+        if m.get("edited"):
+            meta["text"] = text          # body остаётся первым вариантом, правка видна здесь
         if permalink:
             meta["permalink"] = permalink
         return Event(external_id=f"{channel}:{m['ts']}", kind="message", occurred_at=ts_dt(m["ts"]),
                      title=None, body=text, meta=meta, actor_raw=user,
                      thread_key=f"{channel}:{thread_ts or m['ts']}")
+
+    @staticmethod
+    def _search(api: SlackAPI, query: str, max_pages: int = 5) -> list[dict]:
+        out: list[dict] = []
+        page = 1
+        while True:
+            body = api.call("search.messages", query=query, sort="timestamp", sort_dir="desc",
+                            count=100, page=page)
+            msgs = body.get("messages") or {}
+            out += msgs.get("matches") or []
+            pages = (msgs.get("paging") or msgs.get("pagination") or {})
+            total = pages.get("pages") or pages.get("page_count") or 1
+            if page >= min(total, max_pages):
+                return out
+            page += 1
 
     def _replies(self, api: SlackAPI, channel: str, thread_ts: str, oldest: str | None) -> list[dict]:
         return list(api.paged("conversations.replies", "messages", channel=channel, ts=thread_ts,
@@ -200,11 +224,35 @@ class SlackCollector(Collector):
                 else:
                     raise
 
+        since = self.since(default_days=initial.days)
+        after = (since - timedelta(days=1)).date().isoformat()        # after: исключает сам день
+
+        # 2б. ожившие старые треды своих каналов: ответ в тред старше thread_days
+        # не виден ни в истории канала, ни в списке живых тредов, его находит поиск
+        if self.cfg.get("channels") and self.cfg.get("search_threads", True):
+            for channel in self.cfg.get("channels") or []:
+                try:
+                    matches = self._search(api, f"in:<#{channel}> after:{after}")
+                except SlackError as e:
+                    if e.error in ("missing_scope", "not_allowed_token_type", "not_authed", "invalid_auth"):
+                        break                       # нет search:read: живём без этого шага
+                    raise
+                for mt in matches:
+                    if not mt.get("ts") or ts_dt(mt["ts"]) < since:
+                        continue
+                    q = parse_qs(urlparse(mt.get("permalink") or "").query)
+                    thread_ts = (q.get("thread_ts") or [None])[0] or mt.get("thread_ts")
+                    if not thread_ts or thread_ts == mt["ts"] or (channel, thread_ts) in fetched_threads:
+                        continue
+                    try:
+                        pull_thread(channel, thread_ts, dt_ts(since - timedelta(days=1)))
+                    except SlackError as e:
+                        if e.error not in ("thread_not_found", "channel_not_found", "not_in_channel"):
+                            raise
+
         # 3. упоминания в любых каналах
         me = self.cfg.get("user_id")
         if me and self.cfg.get("mentions", True):
-            since = self.since(default_days=initial.days)
-            after = (since - timedelta(days=1)).date().isoformat()    # after: исключает сам день
             page = 1
             while True:
                 body = api.call("search.messages", query=f"<@{me}> after:{after}", sort="timestamp",

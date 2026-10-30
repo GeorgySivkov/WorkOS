@@ -10,6 +10,9 @@ WorkingDirectory=/opt/workos
 Environment=WORKOS_ROLE=bot
 Environment=HOME=/var/lib/workos-bot
 Environment=PYTHONUNBUFFERED=1
+# claude CLI пишет в ~/.claude, ~/.cache, ~/.config: это /var/lib/<user>, он в ReadWritePaths;
+# сам себя не обновляет (/usr только на чтение)
+Environment=DISABLE_AUTOUPDATER=1
 ExecStart=/opt/workos/.venv/bin/python -m bot.terminal
 Restart=always
 RestartSec=10
@@ -19,6 +22,8 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/workos-bot /tmp
 PrivateTmp=true
+ProtectProc=invisible
+# ProcSubset=pid не ставим: claude CLI (node), onnxruntime и whisper читают /proc/meminfo и /proc/cpuinfo
 
 [Install]
 WantedBy=multi-user.target

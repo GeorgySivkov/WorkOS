@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 
 from core import config
+from core.tg import scrub
 
 from bot import capture
 from bot.topics import Ctx
@@ -68,9 +69,10 @@ def handle(ctx: Ctx, msg: dict) -> int | None:
     try:
         text = transcribe(ctx.bot.download(media["file_id"]))
     except Exception as e:
-        log.warning("расшифровка не удалась: %s", e)
+        err = scrub(f"{type(e).__name__}: {e}")[:300]      # в тексте ошибки скачивания мог быть токен
+        log.warning("расшифровка не удалась: %s", err)
         eid = capture.store_event(ctx, msg, body="", meta={"voice": True, "transcribed": False,
-                                                          "error": str(e)[:300]})
+                                                          "error": err})
         if eid is not None:
             ctx.reply(msg, "Голос сохранён, но расшифровать не вышло.")
         return eid

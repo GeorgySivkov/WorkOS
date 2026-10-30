@@ -169,14 +169,15 @@ def parse(text: str, now: datetime | None = None) -> Parsed:
     remind_at = None
     if at is not None:
         if due is None:
-            # время без даты: ближайшее будущее внутри логических суток
-            d = today + timedelta(days=1) if at.hour < 4 else today
-            cand = tu.at_local(d, at)
+            # время без даты: ближайшее будущее; день задачи = логический день этого момента
+            cand = tu.local_dt_for(today, at)
             if cand <= now:
-                d += timedelta(days=1)
-                cand = tu.at_local(d, at)
-            due = d
-        remind_at = tu.at_local(due, at)
+                cand = tu.local_dt_for(today + timedelta(days=1), at)
+            due = tu.logical_date(cand)
+            remind_at = cand
+        else:
+            # 00:00-03:59 дня due это ночь после него, а не начало календарных суток
+            remind_at = tu.local_dt_for(due, at)
 
     title = text
     for a, b in sorted(spans, reverse=True):

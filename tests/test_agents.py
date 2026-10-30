@@ -60,7 +60,7 @@ def reader(role_env):
 
 # ---------- 6.2 propose ----------
 
-def test_propose_modes_sampling_never_auto_dedup(admin, as_role):
+def test_propose_inserts_proposal_only(admin, as_role):
     conn = as_role("workos_reader")
     a1 = autonomy.propose(conn, "task_add", "personal", {"title": "a", "size": "S"}, "почему")
     row = admin.execute("SELECT * FROM work.actions WHERE id = %s", (a1,)).fetchone()
@@ -70,31 +70,18 @@ def test_propose_modes_sampling_never_auto_dedup(admin, as_role):
     assert autonomy.propose(conn, "task_add", "personal", {"title": "a", "size": "S"}) == a1
     assert admin.execute("SELECT count(*) AS n FROM work.actions").fetchone()["n"] == 1
 
-    # автономия и семплинг: каждое пятое идёт на подтверждение
+    # режим решает бот: даже при auto-строке предложение остаётся «на подтверждение»,
+    # семплинг читатель не трогает
     admin.execute("INSERT INTO work.autonomy (action_type, context_id, mode) VALUES ('task_add', 'personal', 'auto')")
-    modes = []
-    for i in range(10):
+    for i in range(3):
         aid = autonomy.propose(conn, "task_add", "personal", {"title": f"t{i}", "size": "S"})
-        modes.append(admin.execute("SELECT autonomy FROM work.actions WHERE id = %s", (aid,)).fetchone()["autonomy"])
-    assert modes == ["auto"] * 4 + ["approval"] + ["auto"] * 4 + ["approval"]
+        assert admin.execute("SELECT autonomy FROM work.actions WHERE id = %s", (aid,)).fetchone()["autonomy"] == "approval"
     assert admin.execute("SELECT auto_count FROM work.autonomy WHERE action_type = 'task_add'").fetchone()[
-        "auto_count"] == 10
+        "auto_count"] == 0
 
-    # строка '*' действует на все контексты
-    admin.execute("INSERT INTO work.autonomy (action_type, context_id, mode) VALUES ('plan_batch', '*', 'auto')")
-    aid = autonomy.propose(conn, "plan_batch", "alfa", {"for_date": "2026-11-02", "items": [], "week_items": []})
-    assert admin.execute("SELECT autonomy FROM work.actions WHERE id = %s", (aid,)).fetchone()["autonomy"] == "auto"
-
-    # тип с внешней видимостью: никогда не auto, даже если строка так говорит
-    admin.execute("INSERT INTO work.autonomy (action_type, context_id, mode) VALUES ('email_reply', 'personal', 'auto')")
-    aid = autonomy.propose(conn, "email_reply", "personal", {"account": "a", "to": ["x@y"], "cc": [],
-                                                            "subject": "Re: x", "body": "ok"})
-    assert admin.execute("SELECT autonomy FROM work.actions WHERE id = %s", (aid,)).fetchone()["autonomy"] == "approval"
-
-    # /manual запер: всё на подтверждение
-    admin.execute("UPDATE work.autonomy SET locked = true WHERE action_type = 'task_add'")
-    aid = autonomy.propose(conn, "task_add", "personal", {"title": "locked", "size": "S"})
-    assert admin.execute("SELECT autonomy FROM work.actions WHERE id = %s", (aid,)).fetchone()["autonomy"] == "approval"
+    # без контекста: personal
+    aid = autonomy.propose(conn, "plan_batch", None, {"for_date": "2026-11-02", "items": [], "week_items": []})
+    assert admin.execute("SELECT context_id FROM work.actions WHERE id = %s", (aid,)).fetchone()["context_id"] == "personal"
 
 
 # ---------- 6.2 продвижение и деградация ----------
@@ -109,40 +96,56 @@ def _outcomes(admin, atype, ctx, verdicts, days_ago=1):
 
 def test_autonomy_promote_and_demote(admin, reader):
     _outcomes(admin, "plan_batch", "personal", ["accepted"] * 19 + ["edited"])           # 0.95, n=20
-    _outcomes(admin, "task_add", "personal", ["accepted"] * 18)                          # n<20
-    _outcomes(admin, "trello_card", "infatica", ["accepted"] * 5 + ["rejected"] * 5)     # 0.5, auto -> вниз
-    _outcomes(admin, "email_reply", "infatica", ["accepted"] * 30)                       # никогда
-    _outcomes(admin, "task_add", "infatica", ["accepted"] * 25)                          # заперто
+    _outcomes(admin, "plan_batch", "consulting", ["accepted"] * 40 + ["rejected"] * 7)   # 0.851 > 0.85 без округления
+    _outcomes(admin, "plan_batch", "infatica", ["accepted"] * 17 + ["rejected"] * 3)     # ровно 0.85: не выше
     _outcomes(admin, "plan_batch", "alfa", ["accepted"] * 25, days_ago=40)               # вне окна 30 дней
-    _outcomes(admin, "calendar_block", "consulting", ["accepted"] + ["rejected"] * 3)   # '*' auto, 0.25 -> вниз
-    _outcomes(admin, "calendar_block", "personal", ["accepted"] * 10)                    # наследует '*'
+    _outcomes(admin, "task_add", "personal", ["accepted"] * 18)                          # n<20, наследует '*' auto
+    _outcomes(admin, "task_add", "consulting", ["accepted"] + ["rejected"] * 3)          # '*' auto, 0.25 -> вниз
+    _outcomes(admin, "task_add", "infatica", ["accepted"] * 25)                          # заперто
+    _outcomes(admin, "trello_card", "infatica", ["accepted"] * 5 + ["rejected"] * 5)     # 0.5, auto -> вниз
+    _outcomes(admin, "trello_card", "personal", ["accepted"] * 30)                       # внешний: вверх никогда
+    _outcomes(admin, "email_reply", "infatica", ["accepted"] * 30)                       # никогда
     admin.execute("INSERT INTO work.autonomy (action_type, context_id, mode) VALUES ('trello_card', 'infatica', 'auto'), "
-                  "('calendar_block', '*', 'auto')")
+                  "('task_add', '*', 'auto'), ('calendar_block', '*', 'auto')")
     admin.execute("INSERT INTO work.autonomy (action_type, context_id, mode, locked) "
                   "VALUES ('task_add', 'infatica', 'approval', true)")
 
+    dry = autonomy.run(dry_run=True)
+    assert dry["changes"] and admin.execute("SELECT count(*) AS n FROM work.autonomy").fetchone()["n"] == 4
     res = autonomy.run()
     modes = {(r["action_type"], r["context_id"]): r for r in admin.execute("SELECT * FROM work.autonomy")}
     assert modes[("plan_batch", "personal")]["mode"] == "auto"
     assert "19 из 20" in modes[("plan_batch", "personal")]["reason"]
-    assert modes[("task_add", "personal")]["mode"] == "approval"
+    assert modes[("plan_batch", "consulting")]["mode"] == "auto"
+    assert modes[("plan_batch", "infatica")]["mode"] == "approval"
+    assert ("plan_batch", "alfa") not in modes
+    assert modes[("task_add", "personal")]["mode"] == "auto"            # своя строка, режим от '*'
+    assert modes[("task_add", "consulting")]["mode"] == "approval"
+    assert modes[("task_add", "infatica")]["mode"] == "approval" and modes[("task_add", "infatica")]["locked"]
     assert modes[("trello_card", "infatica")]["mode"] == "approval"
     assert "ниже порога" in modes[("trello_card", "infatica")]["reason"]
+    assert modes[("trello_card", "personal")]["mode"] == "approval"
     assert modes[("email_reply", "infatica")]["mode"] == "approval"
-    assert modes[("task_add", "infatica")]["mode"] == "approval"
-    assert ("plan_batch", "alfa") not in modes
-    assert modes[("calendar_block", "consulting")]["mode"] == "approval"
-    assert modes[("calendar_block", "personal")]["mode"] == "auto" and modes[("calendar_block", "*")]["mode"] == "auto"
-    assert {(c["type"], c["context"], c["mode"]) for c in res["changes"]} == {
-        ("plan_batch", "personal", "auto"), ("trello_card", "infatica", "approval"),
-        ("calendar_block", "consulting", "approval")}
+    assert modes[("calendar_block", "*")]["mode"] == "approval"         # внешний тип в auto: вниз без статистики
+    expected = {("plan_batch", "personal", "auto"), ("plan_batch", "consulting", "auto"),
+                ("task_add", "consulting", "approval"), ("trello_card", "infatica", "approval"),
+                ("calendar_block", "*", "approval")}
+    assert {(c["type"], c["context"], c["mode"]) for c in res["changes"]} == expected
+    assert {(c["type"], c["context"], c["mode"]) for c in dry["changes"]} == expected
     msgs = outbox(admin, "system")
-    assert len(msgs) == 3 and not any(LONG_DASH.search(m["text"]) for m in msgs)
+    assert len(msgs) == 5 and not any(LONG_DASH.search(m["text"]) for m in msgs)
     assert any("plan_batch" in m["text"] and "без подтверждения" in m["text"] for m in msgs)
 
     # повторный прогон ничего не меняет и не шумит
     assert autonomy.run()["changes"] == []
-    assert len(outbox(admin, "system")) == 3
+    assert len(outbox(admin, "system")) == 5
+
+    # общий рубильник /manual: разбор статистики режимы не двигает
+    admin.execute("UPDATE work.autonomy SET mode = 'approval' WHERE action_type = 'plan_batch'")
+    admin.execute("INSERT INTO work.autonomy (action_type, context_id, mode, locked) VALUES ('*', '*', 'approval', true)")
+    assert autonomy.run()["changes"] == []
+    assert admin.execute("SELECT mode FROM work.autonomy WHERE action_type = 'plan_batch' "
+                         "AND context_id = 'personal'").fetchone()["mode"] == "approval"
 
 
 # ---------- 4.1 извлечение ----------
@@ -511,3 +514,145 @@ def test_sprint_report_from_db(admin, reader, capsys):
     quiet = reports.run(kind="week", quiet=True, context="infatica")
     assert "Релиз SDK 2.0 в ноябре" in quiet["text"] and not capsys.readouterr().out
     assert not LONG_DASH.search(out + quiet["text"])
+
+
+# ---------- ревью: голое имя, сбои модели, дубли отчётов ----------
+
+def test_resolve_person_bare_name_never_resolves_between_two_candidates():
+    """«Саша» при двух Сашах среди участников: обличье «Саша» у Петрова ничего не решает."""
+    parts = [{"person_id": 1, "name": "Саша Петров", "aliases": ["Саша"]},
+             {"person_id": 2, "name": "Александр Иванов", "aliases": []},
+             {"person_id": 3, "name": "Ян Иванов", "aliases": []}]
+    assert decisions.resolve_person("Саша", parts) is None
+    assert decisions.resolve_person("Сашей", parts) is None
+    assert decisions.resolve_person("Саша Петров", parts) == 1
+    assert decisions.resolve_person("Петров", parts) == 1
+    assert decisions.resolve_person("Сашей Ивановым", parts) == 2     # пара бьёт голое имя
+    assert decisions.resolve_person("Яну", parts) == 3
+    assert decisions.resolve_person("Саша Смирнов", parts) is None    # другой Саша, не наш
+    assert decisions.resolve_person("Ян и Саша Петров", parts) is None  # двое в одной строке
+    assert decisions.resolve_person("Георгий", parts) is None
+    # один Саша среди участников: голое имя разрешается
+    assert decisions.resolve_person("Саша", parts[:1] + parts[2:]) == 1
+
+
+def test_extract_bare_alias_does_not_steal_commitment(admin, reader, fake):
+    petrov = person(admin, "Саша Петров")
+    admin.execute("INSERT INTO work.identities (person_id, kind, value, context_id, confidence) "
+                  "VALUES (%s, 'display_name', 'Саша', 'infatica', 1.0)", (petrov,))
+    ivanov = person(admin, "Александр Иванов")
+    mt = ev(admin, "plaud", "meeting", tu.now() - timedelta(hours=2), "SDK", body="...",
+            meta={"participant_ids": [petrov, ivanov]})
+    fake.on["extract"] = lambda s, u: json.dumps({"decisions": [], "tasks": [], "commitments": [
+        {"direction": "theirs", "person": "Саша", "what": "выгрузка обращений", "due": None}]})
+    assert decisions.run()["processed"] == 1
+    c = admin.execute("SELECT person_id, what FROM work.commitments WHERE source_event = %s", (mt,)).fetchone()
+    assert c["person_id"] is None and c["what"] == "Саша: выгрузка обращений"
+
+
+def test_extract_failures_are_capped_and_do_not_block(admin, reader, fake, monkeypatch):
+    monkeypatch.setattr(decisions, "RETRY_HOURS", 0)
+    bad = ev(admin, "plaud", "meeting", tu.now() - timedelta(days=2), "Сломанная", body="плохой транскрипт")
+
+    def extract(system, user):
+        if "плохой транскрипт" in user:
+            raise llm.LLMError("claude -p exit 1: overloaded")
+        return json.dumps({"decisions": [{"statement": "Решили"}], "tasks": [], "commitments": []})
+    fake.on["extract"] = extract
+
+    r1 = decisions.run(limit=1)
+    assert r1["errors"] and not r1["gave_up"]
+    meta = admin.execute("SELECT meta FROM work.events WHERE id = %s", (bad,)).fetchone()["meta"]
+    assert meta["extract"]["attempts"] == 1 and "overloaded" in meta["extract"]["error"]
+    # свежая встреча идёт раньше той, что уже падала: старая не держит очередь
+    good = ev(admin, "plaud", "meeting", tu.now() - timedelta(hours=1), "Нормальная", body="хороший")
+    assert decisions.run(limit=1)["processed"] == 1
+    assert admin.execute("SELECT 1 FROM work.notices WHERE key = %s", (f"extract:{good}",)).fetchone()
+    # пауза перед повтором: при RETRY_HOURS=1 только что упавшая встреча не берётся
+    monkeypatch.setattr(decisions, "RETRY_HOURS", 1)
+    assert decisions.run()["meetings"] == 0
+    monkeypatch.setattr(decisions, "RETRY_HOURS", 0)
+    assert decisions.run()["gave_up"] == []                         # вторая попытка
+    assert decisions.run()["gave_up"] == [bad]                      # третья: сдаёмся
+    sys_msgs = outbox(admin, "system")
+    assert len(sys_msgs) == 1 and "«Сломанная»" in sys_msgs[0]["text"] and "3 попытки" in sys_msgs[0]["text"]
+    assert f"extract:{bad}" in sys_msgs[0]["text"] and not LONG_DASH.search(sys_msgs[0]["text"])
+    n = len(fake.calls)
+    assert decisions.run()["meetings"] == 0 and len(fake.calls) == n
+    assert len(outbox(admin, "system")) == 1
+
+
+def test_drafter_failures_are_capped(admin, reader, fake, monkeypatch):
+    monkeypatch.setenv("WORKOS_ME_EMAILS", "george@me.io")
+    monkeypatch.setenv("TRELLO_PROPOSE_LIST_ID", "LIST1")
+    monkeypatch.setattr(drafter, "RETRY_HOURS", 0)
+    t = tu.now() - timedelta(hours=3)
+    mail = ev(admin, "gmail:personal", "email", t, "Вопрос", "Когда?", context="personal",
+              meta={"from": "a@b.c", "triage": {"needs_reply": True}})
+    mt = ev(admin, "plaud", "meeting", t, "SDK weekly", "транскрипт",
+            meta={"extract": {"tasks": [{"title": "Собрать дашборд", "size": "M"}]}})
+
+    def broken(system, user):
+        raise llm.LLMError("claude -p exit 1: rate limit")
+    fake.on["drafter"] = broken
+
+    for _ in range(drafter.MAX_ATTEMPTS):
+        res = drafter.run()
+        assert res["replies"]["errors"] == 1 and res["trello"]["errors"] == 1
+    assert res["replies"]["gave_up"] == 1 and res["trello"]["gave_up"] == 1
+    meta = admin.execute("SELECT meta FROM work.events WHERE id = %s", (mt,)).fetchone()["meta"]
+    assert meta["trello_draft"]["attempts"] == drafter.MAX_ATTEMPTS
+    keys = {r["key"] for r in admin.execute("SELECT key FROM work.notices")}
+    assert {f"draft:{mail}", f"trello:{mt}"} <= keys
+    texts = [m["text"] for m in outbox(admin, "system")]
+    assert len(texts) == 2 and any("Черновик ответа" in x for x in texts) and any("Карточки Trello" in x for x in texts)
+    n = len(fake.calls)
+    again = drafter.run()
+    assert again["replies"]["candidates"] == 0 and again["trello"]["meetings"] == 0 and len(fake.calls) == n
+    assert len(outbox(admin, "system")) == 2
+
+
+def test_review_and_audit_do_not_duplicate_on_concurrent_run(admin, reader, monkeypatch):
+    """Второй прогон прошёл предварительную проверку, пока первый ещё писал: отчёт один."""
+    today = date(2026, 10, 25)
+    key_r = f"review:{tu.week_monday(today).isoformat()}"
+    orig_collect = review.collect
+
+    def racing_collect(conn, since):
+        admin.execute("INSERT INTO work.notices (key) VALUES (%s)", (key_r,))   # соседний прогон успел
+        return orig_collect(conn, since)
+    monkeypatch.setattr(review, "collect", racing_collect)
+    assert review.run(date=today.isoformat()) == {"skipped": "already_sent", "key": key_r}
+    assert outbox(admin, "system") == []
+
+    key_a = f"audit:{tu.week_monday(today).isoformat()}"
+
+    def racing_idle(conn, day, now):
+        admin.execute("INSERT INTO work.notices (key) VALUES (%s)", (key_a,))
+        return []
+    monkeypatch.setattr(audit, "idle_meetings", racing_idle)
+    assert audit.run(date=today.isoformat(), now=tu.at_local(today, time(19, 30)))["skipped"] == "already_sent"
+    assert outbox(admin, "system") == []
+    # --force шлёт всегда, даже при отметке
+    monkeypatch.setattr(audit, "idle_meetings", lambda conn, day, now: [])
+    assert audit.run(date=today.isoformat(), now=tu.at_local(today, time(19, 30)), force=True)["sent"]
+    assert len(outbox(admin, "system")) == 1
+
+
+def test_triage_failures_are_capped(admin, reader, fake, monkeypatch):
+    monkeypatch.setattr(triage, "RETRY_HOURS", 0)
+    e = ev(admin, "gmail:personal", "email", tu.now() - timedelta(hours=1), "Тема", "текст", context="personal",
+           meta={"from": "a@b.c"})
+
+    def broken(system, user):
+        raise llm.LLMError("нет JSON")
+    fake.on["triage"] = broken
+    for i in range(triage.MAX_ATTEMPTS):
+        res = triage.run()
+        assert res["errors"] == 1 and res["gave_up"] == (1 if i == triage.MAX_ATTEMPTS - 1 else 0)
+    meta = admin.execute("SELECT meta FROM work.events WHERE id = %s", (e,)).fetchone()["meta"]
+    assert meta["triage"]["skipped"] == "error" and meta["triage"]["needs_reply"] is False
+    assert meta["triage_try"]["attempts"] == triage.MAX_ATTEMPTS
+    msgs = outbox(admin, "system")
+    assert len(msgs) == 1 and "Триаж" in msgs[0]["text"] and not LONG_DASH.search(msgs[0]["text"])
+    assert triage.run()["seen"] == 0

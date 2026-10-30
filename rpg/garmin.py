@@ -8,6 +8,7 @@
     garmin:steps:10000          от 10 000 шагов за день
 Начисление: rpg.xp source='garmin', source_ref='<клетка>:<дата>', ON CONFLICT DO NOTHING,
 привычка +10% за каждый день серии до +50%, потолок 100 в день на характеристику.
+Потолок срезает опыт, а не факт: упёрлись в него, запись пишется с нулём, и серия не рвётся.
 
 Вход в Garmin: токены garth в GARMIN_TOKENS (по умолчанию ~/.garminconnect пользователя
 workos-reader). Один раз: `workctl garmin-login` с GARMIN_EMAIL и GARMIN_PASSWORD в .env.reader.
@@ -137,12 +138,13 @@ def _stamp(d: date, now: datetime) -> datetime:
     return min(noon, now) if tu.logical_date(now) == d else noon
 
 
-def award(conn, cell: dict, d: date, now: datetime) -> int:
-    """Начислить опыт клетке за день d по правилам привычки. Возвращает сумму или 0."""
+def award(conn, cell: dict, d: date, now: datetime) -> int | None:
+    """Засчитать клетке день d по правилам привычки. Сумма опыта (0, если день упёрся
+    в потолок: отметка всё равно пишется) или None, если день уже был засчитан."""
     ref = f"{cell['id']}:{d.isoformat()}"
     if conn.execute("SELECT 1 FROM rpg.xp WHERE source = 'garmin' AND source_ref = %s AND cell_id = %s",
                     (ref, cell["id"])).fetchone():
-        return 0
+        return None
     streak = 0
     if cell["kind"] == "habit":
         while streak < 5 and conn.execute(
@@ -154,12 +156,11 @@ def award(conn, cell: dict, d: date, now: datetime) -> int:
         left = config.XP_DAILY_CAP - conn.execute("SELECT rpg.day_xp(%s, %s) AS n",
                                                   (cell["attr"], d)).fetchone()["n"]
         amount = min(amount, left)
-    if amount <= 0:
-        return 0
+    amount = max(amount, 0)
     r = conn.execute("""INSERT INTO rpg.xp (cell_id, amount, source, source_ref, earned_at)
                         VALUES (%s, %s, 'garmin', %s, %s) ON CONFLICT DO NOTHING RETURNING amount""",
                      (cell["id"], amount, ref, _stamp(d, now))).fetchone()
-    return r["amount"] if r else 0
+    return r["amount"] if r else None
 
 
 def run(date: str | None = None, dry_run: bool = False, days: int = 3, client=None, now=None, **kw) -> dict:
@@ -190,14 +191,16 @@ def run(date: str | None = None, dry_run: bool = False, days: int = 3, client=No
         raise
     if dry_run:
         return {"dry_run": True, "hits": [f"{c['id']}:{d}" for c, d in hits]}
-    awarded = {}
+    awarded, capped = {}, []
     with db.connect() as conn, conn.transaction():
         for c, d in hits:
             n = award(conn, c, d, now)
             if n:
                 awarded[f"{c['id']}:{d}"] = n
+            elif n == 0:
+                capped.append(f"{c['id']}:{d}")           # засчитано без опыта: потолок дня
     _mark()
-    return {"days": [d.isoformat() for d in day_list], "hits": len(hits), "awarded": awarded}
+    return {"days": [d.isoformat() for d in day_list], "hits": len(hits), "awarded": awarded, "capped": capped}
 
 
 def _mark(error: str | None = None) -> None:

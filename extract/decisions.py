@@ -6,13 +6,20 @@
 (meta.calendar_event_id). С готовым списком модель раскладывает реплики точнее.
 
 Имя из транскрипта разрешается ТОЛЬКО среди участников этой встречи (правило 3.2):
-глобального поиска по именам нет. Не разрешилось или кандидатов двое, значит
-person_id NULL, а имя остаётся в тексте обещания.
+глобального поиска по именам нет. Разрешает тот же extract.people.NameIndex, что и
+сведение людей: голое имя с двумя кандидатами среди участников не разрешается никогда,
+даже если у одного из них это имя записано обличьем. Не разрешилось или кандидатов
+двое, значит person_id NULL, а имя остаётся в тексте обещания.
 
 Мои обещания с датой сразу предлагаются задачей (task_add) через autonomy.propose.
 Мои задачи без даты остаются в events.meta.extract.tasks: драфтер предложит по
 ним карточку Trello (Инфатика). Обработанная встреча отмечается в work.notices
 ключом 'extract:<event_id>'.
+
+Сбой модели не крутится вечно: попытка пишется в events.meta.extract
+{attempts, error, at}, следующая не раньше чем через attempts часов, свежие встречи
+идут первыми. После MAX_ATTEMPTS встреча отмечается 'extract:<id>' (пропущена) и в
+«Систему» уходит одно сообщение. Повторить руками: удалить эту отметку из work.notices.
 """
 from __future__ import annotations
 
@@ -21,9 +28,12 @@ from datetime import date, timedelta
 
 from agents import autonomy
 from core import config, db, llm, timeutil as tu
+from core.tg import esc
+from extract import people
 from extract.triage import addr, me_emails
 
 LIMIT = 10
+MAX_ATTEMPTS = 3
 HEAD_CHARS, TAIL_CHARS = 30000, 15000      # аргумент claude -p ограничен ~128 КБ
 ME_WORDS = {"me", "я", "george", "георгий", "жора", "гоша", "мне", "мой", "моё"}
 SIZES = {"S", "M", "L"}
@@ -135,31 +145,29 @@ def participants(conn, ev: dict) -> list[dict]:
     return list(found.values())
 
 
-def resolve_person(name, parts: list[dict]) -> int | None:
-    """Имя -> person_id только среди участников. Самая длинная совпавшая форма побеждает,
-    ничья (два Саши) значит None: такие случаи разбирает George через identity_candidates."""
+def name_index(parts: list[dict]) -> people.NameIndex:
+    """Формы имён участников встречи: та же логика, что у extract.people (транслит, падежи,
+    уменьшительные, пары в обоих порядках)."""
+    idx = people.NameIndex()
+    for p in parts:
+        if p.get("person_id"):
+            idx.add(p["person_id"], p["name"], p.get("aliases") or [])
+    return idx
+
+
+def resolve_person(name, parts: list[dict], idx: people.NameIndex | None = None) -> int | None:
+    """Имя -> person_id только среди участников. Пара «имя фамилия» бьёт голое имя, но голое
+    имя, которое среди участников носят двое, не разрешается никогда: точное совпадение с
+    записанным обличьем («Саша» у Петрова) ничего не решает. Принимается только одно
+    упоминание ровно с одним кандидатом, остальное None: такие случаи разбирает George."""
     n = _norm(name)
     if not n or n in ME_WORDS:
         return None
-    toks = set(n.split())
-    best, best_score = set(), 0
-    for p in parts:
-        if not p.get("person_id"):
-            continue
-        score = 0
-        for form in [p["name"], *p.get("aliases", []), (p.get("email") or "").split("@")[0]]:
-            ft = set(_norm(form).split())
-            if not ft:
-                continue
-            if ft == toks:
-                score = max(score, 100 + len(ft))
-            elif ft <= toks or toks <= ft:
-                score = max(score, len(ft & toks))
-        if score > best_score:
-            best, best_score = {p["person_id"]}, score
-        elif score and score == best_score:
-            best.add(p["person_id"])
-    return next(iter(best)) if len(best) == 1 else None
+    idx = idx if idx is not None else name_index(parts)
+    found = people.unique_mentions(idx.scan(str(name), require_cap=False, skip_keys=people.self_keys()))
+    if len(found) != 1 or len(found[0].pids) != 1:
+        return None
+    return next(iter(found[0].pids))
 
 
 # ---------- промпт ----------
@@ -264,8 +272,9 @@ def save(conn, ev: dict, parts: list[dict], data: dict, today: date) -> dict:
                      (ctx, ev["occurred_at"], d["statement"], d["rationale"], db.jb(pids), ev["id"]))
     proposed = 0
     names = {p["person_id"]: p["name"] for p in parts if p.get("person_id")}
+    idx = name_index(parts)
     for c in commitments:
-        pid = resolve_person(c["person"], parts) if c["person"] else None
+        pid = resolve_person(c["person"], parts, idx) if c["person"] else None
         what = c["what"]
         raw = (c["person"] or "").strip()
         if raw and not pid and not _is_me(raw) and _norm(raw) not in _norm(what):
@@ -290,30 +299,66 @@ def save(conn, ev: dict, parts: list[dict], data: dict, today: date) -> dict:
     return summary
 
 
-SELECT = """
-SELECT e.id, e.context_id, e.title, e.body, e.meta, e.occurred_at
+RETRY_HOURS = 1      # пауза перед повтором: attempts * RETRY_HOURS
+
+# попытки: meta.extract.attempts есть только у неудачных (удачная встреча уже в notices)
+_ATTEMPTS = "COALESCE((e.meta->'extract'->>'attempts')::int, 0)"
+SELECT = f"""
+SELECT e.id, e.context_id, e.title, e.body, e.meta, e.occurred_at, {_ATTEMPTS} AS attempts
 FROM work.events e
 WHERE e.kind = 'meeting' AND COALESCE(btrim(e.body), '') <> ''
   AND NOT EXISTS (SELECT 1 FROM work.notices n WHERE n.key = 'extract:' || e.id)
-ORDER BY e.occurred_at
-LIMIT %s
+  AND ({_ATTEMPTS} = 0
+       OR COALESCE((e.meta->'extract'->>'at')::timestamptz, '-infinity')
+          <= now() - make_interval(hours => {_ATTEMPTS} * %(retry)s))
+ORDER BY {_ATTEMPTS}, e.occurred_at
+LIMIT %(n)s
 """
+
+
+def give_up_text(what: str, title: str | None, when, attempts: int, error: str, key: str) -> str:
+    """Одно сообщение в «Систему», когда задача сдалась на элементе."""
+    d = tu.local(when).date() if when else None
+    day = f" ({tu.ru_date(d, False)})" if d else ""
+    return (f"⚠ <b>{esc(what)}</b>: «{esc(title or 'без названия')}»{day} модель не разобрала "
+            f"за {attempts} попытки, пропускаю. Ошибка: <code>{esc(error[:200])}</code>\n"
+            f"Повторить: удалить отметку <code>{esc(key)}</code> из work.notices.")
+
+
+def record_failure(conn, ev: dict, error: str) -> bool:
+    """Неудачная попытка -> meta.extract.attempts. True, если встреча пропущена насовсем."""
+    n = int(ev.get("attempts") or 0) + 1
+    info = {"attempts": n, "error": error[:300], "at": tu.now().isoformat(timespec="seconds")}
+    key = f"extract:{ev['id']}"
+    with conn.transaction():
+        conn.execute("UPDATE work.events SET meta = meta || jsonb_build_object('extract', %s::jsonb) "
+                     "WHERE id = %s", (db.jb(info), ev["id"]))
+        if n < MAX_ATTEMPTS:
+            return False
+        if conn.execute("INSERT INTO work.notices (key) VALUES (%s) ON CONFLICT DO NOTHING RETURNING key",
+                        (key,)).fetchone():
+            conn.execute("INSERT INTO work.outbox (topic, text) VALUES ('system', %s)",
+                         (give_up_text("Извлечение со встречи", ev.get("title"), ev.get("occurred_at"),
+                                       n, error, key),))
+    return True
 
 
 def run(date: str | None = None, dry_run: bool = False, limit: int = LIMIT, **kw) -> dict:
     today = _date(date) or tu.logical_today()
     done, errors, totals = [], [], {"decisions": 0, "commitments": 0, "proposed": 0, "tasks": 0}
+    gave_up = []
     with db.connect(autocommit=True) as conn:      # модель не зовём внутри открытой транзакции
-        meetings = conn.execute(SELECT, (limit,)).fetchall()
+        meetings = conn.execute(SELECT, {"n": limit, "retry": RETRY_HOURS}).fetchall()
         for ev in meetings:
             parts = participants(conn, ev)
             try:
                 data = llm.complete_json("extract", SYSTEM, build_prompt(ev, parts))
+                if not isinstance(data, dict):
+                    raise llm.LLMError("ответ не объект")
             except llm.LLMError as e:
                 errors.append({"event": ev["id"], "error": str(e)[:200]})
-                continue
-            if not isinstance(data, dict):
-                errors.append({"event": ev["id"], "error": "ответ не объект"})
+                if not dry_run and record_failure(conn, ev, str(e)):
+                    gave_up.append(ev["id"])
                 continue
             if dry_run:
                 d, c, t = normalize(data)
@@ -325,7 +370,8 @@ def run(date: str | None = None, dry_run: bool = False, limit: int = LIMIT, **kw
             for k in ("decisions", "commitments", "proposed"):
                 totals[k] += s[k]
             totals["tasks"] += len(s["tasks"])
-    return {"meetings": len(meetings), "processed": len(done), **totals, "errors": errors, "dry_run": dry_run}
+    return {"meetings": len(meetings), "processed": len(done), **totals, "errors": errors,
+            "gave_up": gave_up, "dry_run": dry_run}
 
 
 if __name__ == "__main__":

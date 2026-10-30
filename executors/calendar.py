@@ -12,6 +12,8 @@ blocks(): задачи со временем (work.tasks.planned_*) пишутс
 побеждает автоматическое: перетащенный блок меняет время задачи (planned_by='manual'),
 удалённый снимает с задачи время. Изменения читаются через syncToken, который
 лежит в файле состояния в EXEC_STATE_DIR (по умолчанию /var/lib/workos-exec).
+Там же plan.<календарь>.own: updated, который Google вернул на нашу последнюю
+запись блока; изменение с тем же updated за ручное не принимается.
 
 .env.executor: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_WRITE_REFRESH_TOKEN,
 GCAL_MIRROR_MAP='{"infatica": "<id календаря>", "alfa": "<id календаря>"}',
@@ -199,11 +201,14 @@ def differs(ev: dict, body: dict) -> bool:
     return any(have.get(k) != v for k, v in body["extendedProperties"]["private"].items())
 
 
-def _insert_or_get(api: GCal, cal: str, body: dict, kind: str) -> tuple[str, dict | None]:
+def _insert_or_get(api: GCal, cal: str, body: dict, kind: str,
+                   own: dict | None = None) -> tuple[str, dict | None]:
     """Вставить с нашим id. 409 (id уже есть или был удалён) -> прочитать событие.
 
     Возвращает ("inserted", None) | ("existing", событие) | ("foreign", событие)."""
-    if api.insert(cal, body) is not None:
+    created = api.insert(cal, body)
+    if created is not None:
+        remember_own(own, created)
         return "inserted", None
     ev = api.get(cal, body["id"])
     if ev is None:
@@ -221,12 +226,12 @@ def _upsert(api: GCal, cal: str, body: dict, kind: str) -> str:
     return _patch_if_changed(api, cal, ev, body)
 
 
-def _patch_if_changed(api: GCal, cal: str, ev: dict, body: dict) -> str:
+def _patch_if_changed(api: GCal, cal: str, ev: dict, body: dict, own: dict | None = None) -> str:
     if not differs(ev, body):
         return "unchanged"
     patch = {k: v for k, v in body.items() if k != "id"}
     patch["status"] = "confirmed"      # копия, удалённая раньше, оживает с тем же id
-    api.patch(cal, ev["id"], patch)
+    remember_own(own, api.patch(cal, ev["id"], patch))
     return "restored" if ev.get("status") == "cancelled" else "updated"
 
 
@@ -335,14 +340,52 @@ def block_body(t: dict) -> dict:
     }
 
 
-def manual_change(t: dict, ev: dict) -> str | None:
+OWN_KEEP = 1000                         # сколько своих отметок updated держать в состоянии
+
+
+def _same_instant(a: str | None, b: str | None) -> bool:
+    if not a or not b:
+        return False
+    try:
+        return base.parse_iso(a) == base.parse_iso(b)
+    except ValueError:
+        return a == b
+
+
+def remember_own(own: dict | None, ev: dict | None) -> None:
+    """Запомнить updated, который вернул Google на НАШУ запись блока: изменение с
+    ровно этим updated потом не примем за ручное (гонка: наш PATCH читается позже,
+    чем задачу успели поменять, и выглядел бы как перенос руками)."""
+    if own is None or not ev or not ev.get("id") or not ev.get("updated"):
+        return
+    own.pop(ev["id"], None)
+    own[ev["id"]] = ev["updated"]
+    while len(own) > OWN_KEEP:
+        own.pop(next(iter(own)))
+
+
+def is_own(own: dict | None, ev: dict) -> bool:
+    """Событие в том виде, в каком его оставила наша последняя запись. Если нет,
+    отметка устарела (событие менял кто-то ещё) и больше не нужна."""
+    if not own or ev.get("id") not in own:
+        return False
+    if _same_instant(own[ev["id"]], ev.get("updated")):
+        return True
+    own.pop(ev["id"], None)
+    return False
+
+
+def manual_change(t: dict, ev: dict, own: dict | None = None) -> str | None:
     """Ручное действие в Google, которое надо принять в задачу: 'moved' | 'deleted' | None.
 
     Правило: блок изменён в Google после последней сверки, его время отличается
     от задачи, и в базе нет более свежего ручного изменения (ручное побеждает авто,
-    из двух ручных побеждает последнее)."""
+    из двух ручных побеждает последнее). Изменение с updated нашей же последней
+    записи (own) ручным не бывает."""
     synced = t["block_synced_at"]
     if synced is None or not ev.get("updated"):
+        return None
+    if is_own(own, ev):
         return None
     updated = base.parse_iso(ev["updated"])
     if updated <= synced:
@@ -383,7 +426,7 @@ def mark_synced(conn, t: dict) -> None:
                  (t["id"], t["planned_start"], t["planned_end"], t["done_at"] is None, t["dropped_at"] is None))
 
 
-def _pull(api: GCal, conn, cal: str, st: dict, now: datetime, out: dict) -> None:
+def _pull(api: GCal, conn, cal: str, st: dict, now: datetime, out: dict, own: dict | None = None) -> None:
     """Изменения календаря «План» с прошлого прохода: ручные переносы и удаления.
 
     Есть syncToken: только изменения. Токена нет (первый запуск) или Google его
@@ -424,7 +467,7 @@ def _pull(api: GCal, conn, cal: str, st: dict, now: datetime, out: dict) -> None
             if ev.get("status") != "cancelled" and (
                     marker(ev) != "block" or private(ev).get("task_id") != str(t["id"])):
                 continue
-            kind = manual_change(t, ev)
+            kind = manual_change(t, ev, own)
             if kind and accept_manual(conn, t, ev, kind):
                 out[f"manual_{kind}"] += 1
     if token:
@@ -447,11 +490,12 @@ def blocks(conn=None, api: GCal | None = None, now: datetime | None = None, stat
     own_state = state is None
     state = load_state() if own_state else state
     st = state.setdefault("plan", {}).setdefault(cal, {})
+    own = st.setdefault("own", {})      # id блока -> updated нашей последней записи
     out = {"pulled": 0, "manual_moved": 0, "manual_deleted": 0, "inserted": 0, "updated": 0,
            "restored": 0, "unchanged": 0, "deleted": 0, "foreign": 0, "errors": []}
     try:
         # 1. сначала ручные действия из Google: они главнее
-        _pull(api, conn, cal, st, now, out)
+        _pull(api, conn, cal, st, now, out, own)
         if own_state:
             save_state(state)
 
@@ -468,7 +512,7 @@ def blocks(conn=None, api: GCal | None = None, now: datetime | None = None, stat
                 ev = existing.pop(body["id"], None)
                 if ev is None:
                     # нет в окне: новый блок, блок за окном или удалённый (409)
-                    verdict, ev = _insert_or_get(api, cal, body, "block")
+                    verdict, ev = _insert_or_get(api, cal, body, "block", own)
                     if verdict == "foreign":
                         out["foreign"] += 1
                         continue
@@ -476,13 +520,13 @@ def blocks(conn=None, api: GCal | None = None, now: datetime | None = None, stat
                         out["inserted"] += 1
                         mark_synced(conn, t)
                         continue
-                kind = manual_change(t, ev)
+                kind = manual_change(t, ev, own)
                 if kind:
                     # руками перетащили или удалили после прошлого чтения изменений
                     if accept_manual(conn, t, ev, kind):
                         out[f"manual_{kind}"] += 1
                     continue
-                verdict = _patch_if_changed(api, cal, ev, body)
+                verdict = _patch_if_changed(api, cal, ev, body, own)
                 out[verdict] += 1
                 if verdict != "unchanged" or t["block_synced_at"] is None or (
                         t["planned_at"] and t["planned_at"] > t["block_synced_at"]) or (
@@ -502,22 +546,25 @@ def blocks(conn=None, api: GCal | None = None, now: datetime | None = None, stat
             try:
                 if t is not None and ev["id"] == block_id(t["id"]) and t["dropped_at"] is None \
                         and t["planned_start"] is not None and t["planned_end"] is not None:
-                    kind = manual_change(t, ev)
+                    kind = manual_change(t, ev, own)
                     if kind:
                         if accept_manual(conn, t, ev, kind):
                             out[f"manual_{kind}"] += 1
                         continue
                     # задача уехала за окно: блок едет за ней, а не исчезает
-                    out[_patch_if_changed(api, cal, ev, block_body(t))] += 1
+                    out[_patch_if_changed(api, cal, ev, block_body(t), own)] += 1
                     mark_synced(conn, t)
                     continue
                 api.delete(cal, ev["id"])
+                own.pop(ev["id"], None)
                 out["deleted"] += 1
                 if t is not None:
                     mark_synced(conn, t)
             except Exception as e:  # noqa: BLE001
                 out["errors"].append(f"блок {ev['id']}: {e}"[:300])
     finally:
+        if own_state:
+            save_state(state)           # отметки своих записей нужны следующему проходу
         if own_conn:
             conn.close()
         if own_api:

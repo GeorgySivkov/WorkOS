@@ -22,7 +22,13 @@ Sync по «Входящим» (тип 2) и «Календарю» (тип 8). 
 
 Состояние (sources.watermark, JSON): policy_key, folder_sync_key, folders,
 sync_keys, cal_masters (все встречи календаря без лишнего, чтобы каждый прогон
-разворачивать повторы в окне -7..+60 дней), resync, policy.
+разворачивать повторы в окне -7..+60 дней), resync, policy, mail_epoch (номер
+состояния синхронизации «Входящих»: растёт при каждом SyncKey 0).
+
+Письмо: external_id = mail:<хеш DateReceived + From + Subject + размер тела>,
+ServerId лежит в meta.server_id вместе с meta.sync_epoch и служит только адресом
+для флагов «прочитано» и удаления. Встреча на весь день хранится от полуночи по
+Мадриду той даты, что стоит во встрече по её собственному поясу.
 
 CLI:
     python -m collectors.eas --probe   # OPTIONS + Provision + FolderSync, в базу ничего
@@ -45,6 +51,7 @@ import sys
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone, tzinfo
+from datetime import time as dtime
 from pathlib import Path
 from typing import Callable, Iterator
 from zoneinfo import ZoneInfo
@@ -436,6 +443,9 @@ def expand(master: dict, win_start: datetime, win_end: datetime) -> list[dict]:
             continue
         excs_exact[o] = ex
         excs_day[o.astimezone(tz).date()] = ex
+    if excs_day:
+        # вхождение из-за горизонта могли перенести в окно: доходим и до него
+        horizon = max(horizon, max(excs_day))
 
     out = []
     count = 0
@@ -454,16 +464,42 @@ def expand(master: dict, win_start: datetime, win_end: datetime) -> list[dict]:
             continue
         inst = dict(base, orig=orig, start=orig, end=orig + dur)
         if ex:
-            for k in ("subject", "location", "busy_status", "meeting_status", "all_day", "attendees", "body"):
-                if ex.get(k) is not None:
-                    inst[k] = ex[k]
-            if ex.get("start"):
-                inst["start"] = _dt(ex["start"])
-                inst["end"] = _dt(ex.get("end")) or inst["start"] + dur
-            elif ex.get("end"):
-                inst["end"] = _dt(ex["end"])
+            _apply_exception(inst, ex, dur)
         if overlaps(inst["start"], inst["end"]) or win_start <= orig <= win_end:
             out.append(inst)
+    return out
+
+
+_INST_FIELDS = ("subject", "location", "busy_status", "meeting_status", "all_day", "attendees", "body")
+
+
+def _apply_exception(inst: dict, ex: dict, dur: timedelta) -> dict:
+    for k in _INST_FIELDS:
+        if ex.get(k) is not None:
+            inst[k] = ex[k]
+    if ex.get("start"):
+        inst["start"] = _dt(ex["start"])
+        inst["end"] = _dt(ex.get("end")) or inst["start"] + dur
+    elif ex.get("end"):
+        inst["end"] = _dt(ex["end"])
+    return inst
+
+
+def outside_instances(master: dict) -> list[dict]:
+    """Вхождения, которые могли уехать за окно, без развёртки правила: разовая
+    встреча целиком и перенесённые исключения серии. Их строки finalize двигает
+    на новое время, даже если expand() их не отдал."""
+    start, end = _dt(master["start"]), _dt(master.get("end") or master["start"])
+    dur = max(end - start, timedelta(0))
+    base = {k: master.get(k) for k in _INST_FIELDS}
+    if not master.get("recurrence"):
+        return [dict(base, orig=None, start=start, end=start + dur)]
+    out = []
+    for ex in master.get("exceptions") or []:
+        o = _dt(ex.get("orig"))
+        if o is None or ex.get("deleted") or not (ex.get("start") or ex.get("end")):
+            continue
+        out.append(_apply_exception(dict(base, orig=o, start=o, end=o + dur), ex, dur))
     return out
 
 
@@ -485,7 +521,25 @@ def _emails(s: str | None) -> list[str]:
     return [e.lower() for e in EMAIL_RE.findall(s or "")]
 
 
-def parse_email(server_id: str, ad: Node, folder: str) -> Event | None:
+def mail_external_id(ad: Node) -> str | None:
+    """Стабильный id письма: хеш DateReceived + From + Subject (+ размер тела, если есть).
+
+    ServerId годится только как адрес внутри текущего состояния синхронизации:
+    письмо, переложенное в другую папку и обратно, и любой сброс SyncKey дают
+    новый ServerId, а значит дубль. Хеш от самого письма от этого не зависит.
+    EstimatedDataSize считается от полного тела в запрошенном типе (у нас всегда
+    Type 1), поэтому для одного письма он один и тот же."""
+    received = parse_eas_time(ad.text("Email:DateReceived"))
+    if received is None:
+        return None
+    parts = [_iso(received), (ad.text("Email:From") or "").strip(), (ad.text("Email:Subject") or "").strip()]
+    size = ad.text("AirSyncBase:Body/AirSyncBase:EstimatedDataSize")
+    if size:
+        parts.append(size.strip())
+    return "mail:" + hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:32]
+
+
+def parse_email(server_id: str, ad: Node, folder: str, epoch: int = 0) -> Event | None:
     received = parse_eas_time(ad.text("Email:DateReceived"))
     if received is None:
         return None
@@ -501,7 +555,9 @@ def parse_email(server_id: str, ad: Node, folder: str) -> Event | None:
         "to_emails": _emails(ad.text("Email:To")), "cc_emails": _emails(ad.text("Email:Cc")),
         "read": ad.text("Email:Read") == "1",
         "importance": IMPORTANCE.get(ad.int("Email:Importance", 1), "normal"),
-        "folder": folder, "server_id": server_id,
+        # server_id + sync_epoch: адрес письма в текущем состоянии синхронизации,
+        # по нему finalize() находит строку для флагов «прочитано» и удаления
+        "folder": folder, "server_id": server_id, "sync_epoch": epoch, "removed": False,
         "message_class": ad.text("Email:MessageClass") or "IPM.Note",
         "has_attachments": ad.has("AirSyncBase:Attachments") or ad.has("Email:Attachments"),
     }
@@ -509,7 +565,7 @@ def parse_email(server_id: str, ad: Node, folder: str) -> Event | None:
         meta["truncated"] = True
     if ad.has("Email:MeetingRequest"):
         meta["meeting_request"] = True
-    return Event(external_id=f"mail:{server_id}", kind="email", occurred_at=received,
+    return Event(external_id=mail_external_id(ad), kind="email", occurred_at=received,
                  title=ad.text("Email:Subject") or "", body=body, meta=meta,
                  actor_raw=sender or None, thread_key=thread)
 
@@ -591,9 +647,31 @@ def parse_calendar(server_id: str, ad: Node) -> dict:
     }
 
 
+def _nearest_date(dt: datetime, tz: tzinfo) -> date:
+    """Дата ближайшей полуночи по стене tz (устойчиво к сдвигу пояса на несколько часов)."""
+    return (dt.astimezone(tz) + timedelta(hours=12)).date()
+
+
+def _all_day_span(master: dict, start: datetime, end: datetime) -> tuple[datetime, datetime]:
+    """Встреча на весь день: EAS шлёт полночь в поясе встречи, переведённую в UTC
+    (Москва: 21:00Z накануне). Дату берём по поясу самой встречи и храним как
+    полночь по Мадриду, как это делает iCal-коллектор, иначе зеркало сдвигает
+    событие на день раньше."""
+    tz = parse_timezone(master.get("tz"))
+    d0 = _nearest_date(start, tz)
+    d1 = _nearest_date(max(end, start), tz)
+    if d1 <= d0:
+        d1 = d0 + timedelta(days=1)
+    return tu.at_local(d0, dtime(0, 0)), tu.at_local(d1, dtime(0, 0))
+
+
 def calendar_event(master: dict, inst: dict) -> Event:
     uid = master["uid"]
     rid = _iso(inst["orig"]) if inst.get("orig") else ""
+    all_day = bool(inst.get("all_day"))
+    start, end = inst["start"], inst["end"]
+    if all_day:
+        start, end = _all_day_span(master, start, end)
     ms = inst.get("meeting_status")
     cancelled = ms in CANCELLED_MEETING
     bs = inst.get("busy_status")
@@ -603,8 +681,8 @@ def calendar_event(master: dict, inst: dict) -> Event:
         busy = False
     org_mail, org_name = master.get("organizer_email") or "", master.get("organizer_name") or ""
     meta = {
-        "ends_at": _iso(inst["end"]), "uid": uid, "recurrence_id": rid,
-        "all_day": bool(inst.get("all_day")), "location": inst.get("location") or "",
+        "ends_at": _iso(end), "uid": uid, "recurrence_id": rid,
+        "all_day": all_day, "location": inst.get("location") or "",
         "status": "cancelled" if cancelled else "confirmed", "busy": busy,
         "updated": master.get("dtstamp"), "attendees": inst.get("attendees") or [],
         "organizer": org_mail, "organizer_name": org_name,
@@ -612,7 +690,7 @@ def calendar_event(master: dict, inst: dict) -> Event:
         "folder": "calendar", "server_id": master.get("server_id"),
     }
     actor = f"{org_name} <{org_mail}>".strip() if org_mail else (org_name or None)
-    return Event(external_id=f"{uid}|{rid}", kind="calendar", occurred_at=inst["start"],
+    return Event(external_id=f"{uid}|{rid}", kind="calendar", occurred_at=start,
                  title=inst.get("subject") or "", body=inst.get("body"), meta=meta, actor_raw=actor)
 
 
@@ -1054,10 +1132,12 @@ class EASCollector(Collector):
         self._reset_run()
 
     def _reset_run(self) -> None:
-        self._mail_patches: dict[str, dict] = {}
+        self._mail_patches: dict[tuple[str, int], dict] = {}   # (ServerId, эпоха синхронизации) -> флаги
         self._deleted_uids: set[str] = set()
-        self._known_ids: set[str] = set()
+        self._known_ids: set[str] = set()       # вхождения, отданные в этом прогоне
         self._known_uids: set[str] = set()
+        self._moved_out: dict[str, Event] = {}  # встречи, уехавшие за окно: только обновить строку
+        self._touched: set[str] = set()         # мастера встреч, пришедшие в этом прогоне (Add/Change)
         self.win = (None, None)
         self.counts = {"email": 0, "calendar": 0}
 
@@ -1166,6 +1246,10 @@ class EASCollector(Collector):
         more = False
         trunc = MAIL_TRUNCATION if cls == "Email" else CAL_TRUNCATION
         while True:
+            if cls == "Email" and key == "0":
+                # новое состояние синхронизации: ServerId раздаются заново, старые
+                # адреса писем (meta.server_id) с этого момента ничего не значат
+                st["mail_epoch"] = int(st.get("mail_epoch") or 0) + 1
             try:
                 r = cl.sync(fid, key, cls, WINDOW_SIZE, self._filter(cls), trunc)
             except EASHierarchyChanged:
@@ -1211,26 +1295,29 @@ class EASCollector(Collector):
         out: list[Event] = []
         if cls == "Email":
             fname = (st.get("folders", {}).get(fid) or {}).get("name") or "Inbox"
+            epoch = int(st.get("mail_epoch") or 0)
             for sid, ad in r["adds"] + r["changes"]:
                 if ad.has("Email:DateReceived"):
-                    ev = parse_email(sid, ad, fname)
+                    ev = parse_email(sid, ad, fname, epoch)
                     if ev:
                         out.append(ev)
                         self._check_quarantine(ev)
                 else:
                     patch = _email_patch(ad)
                     if patch:
-                        self._mail_patches.setdefault(f"mail:{sid}", {}).update(patch)
-            for sid in r["deletes"]:
-                self._mail_patches.setdefault(f"mail:{sid}", {})["removed"] = True
+                        self._mail_patches.setdefault((sid, epoch), {}).update(patch)
+            for sid in r["deletes"]:                      # SoftDelete = ушло за фильтр, не удаление
+                self._mail_patches.setdefault((sid, epoch), {})["removed"] = True
             return out
         masters = st.setdefault("cal_masters", {})
         resync = (st.get("resync") or {}).get(fid)
         for sid, ad in r["adds"]:
             masters[sid] = parse_calendar(sid, ad)
+            self._touched.add(sid)
             if resync is not None:
                 resync.append(sid)
         for sid, ad in r["changes"]:
+            self._touched.add(sid)
             parsed = parse_calendar(sid, ad)
             if ad.has("Calendar:StartTime") or sid not in masters:
                 masters[sid] = parsed
@@ -1254,21 +1341,31 @@ class EASCollector(Collector):
                         ev.title, self.client.device_id)
 
     def _expand_calendar(self) -> list[Event]:
+        """Вхождения в окне -> события. Известными (_known_ids) считаются только
+        отданные события: строка встречи, которую в этот раз не отдали, либо
+        уехала за окно (её двигает finalize по _moved_out), либо пропала (отмена)."""
         win_start, win_end = self.win
         masters = self.state.setdefault("cal_masters", {})
         out: list[Event] = []
         for sid, m in list(masters.items()):
-            if self._stale(m, win_start):
+            stale = self._stale(m, win_start)
+            if stale:
+                # серию укоротили или встречу унесли далеко в прошлое: из состояния
+                # убираем, но строки в окне ещё надо подвинуть или отменить
                 masters.pop(sid)
-                continue
-            uid = m["uid"]
-            self._known_uids.add(uid)
-            if not m.get("recurrence"):
-                self._known_ids.add(f"{uid}|")
-            for inst in expand(m, win_start, win_end):
+            self._known_uids.add(m["uid"])
+            emitted: set[str] = set()
+            for inst in ([] if stale else expand(m, win_start, win_end)):
                 ev = calendar_event(m, inst)
-                self._known_ids.add(ev.external_id)
+                emitted.add(ev.external_id)
                 out.append(ev)
+            self._known_ids |= emitted
+            if sid not in self._touched:
+                continue                        # без изменений: за окно сама не уедет
+            for inst in outside_instances(m):
+                ev = calendar_event(m, inst)
+                if ev.external_id not in emitted:
+                    self._moved_out[ev.external_id] = ev
         return out
 
     @staticmethod
@@ -1287,10 +1384,21 @@ class EASCollector(Collector):
 
     def finalize(self, conn, seen: set[str]) -> None:
         sid = self.source_id
-        for ext, patch in self._mail_patches.items():
+        # флаги писем: строку ищем по адресу в текущем состоянии синхронизации
+        # (server_id + эпоха), external_id от ServerId больше не зависит. Строки
+        # старого формата (mail:<ServerId>, без эпохи) считаются эпохой 0.
+        for (server_id, epoch), patch in self._mail_patches.items():
             conn.execute("UPDATE work.events SET meta = meta || %s "
-                         "WHERE source_id = %s AND external_id = %s AND NOT (meta @> %s)",
-                         (db.jb(patch), sid, ext, db.jb(patch)))
+                         "WHERE source_id = %s AND kind = 'email' AND meta->>'server_id' = %s "
+                         "AND COALESCE(meta->>'sync_epoch', '0') = %s AND NOT (meta @> %s)",
+                         (db.jb(patch), sid, server_id, str(epoch), db.jb(patch)))
+        # встреча уехала за окно: строку двигаем туда же (новых строк за окном не создаём)
+        for ext, ev in self._moved_out.items():
+            meta = db.jb(ev.meta)
+            conn.execute("UPDATE work.events SET occurred_at = %s, title = %s, meta = meta || %s "
+                         "WHERE source_id = %s AND kind = 'calendar' AND external_id = %s "
+                         "AND (occurred_at <> %s OR title IS DISTINCT FROM %s OR NOT (meta @> %s))",
+                         (ev.occurred_at, ev.title, meta, sid, ext, ev.occurred_at, ev.title, meta))
         cancel = db.jb({"status": "cancelled", "busy": False})
         known = list(self._known_ids)
         if self._deleted_uids:
@@ -1308,8 +1416,10 @@ class EASCollector(Collector):
             for r in rows:
                 if r["external_id"] in self._known_ids:
                     continue
+                # не отдана, а исходное начало или текущее место строки в окне:
+                # вхождение удалили или унесли за окно, призрака в окне не оставляем
                 orig = _dt(r["rid"]) if r["rid"] else r["occurred_at"]
-                if self._in_window(orig):
+                if self._in_window(orig) or self._in_window(r["occurred_at"]):
                     stale.append(r["id"])
             if stale:
                 conn.execute("UPDATE work.events SET meta = meta || %s WHERE id = ANY(%s)", (cancel, stale))
@@ -1396,14 +1506,28 @@ def watch(heartbeat: int = 900, max_interval: int = 1800, max_cycles: int | None
     """Сервис: Ping с длинным heartbeat, Sync при изменениях и не реже раза в 30 минут.
 
     SIGTERM/SIGINT: дожидаемся конца записи в базу и выходим. Неисправимые ошибки
-    (пароль, карантин) останавливают цикл: status='fatal'.
+    (пароль, карантин) останавливают цикл: status='fatal'. Источник выключен:
+    status='disabled', нет настроек ALFA_EAS_*: status='config'. На все три main()
+    выходит с кодом 3, и systemd (RestartPreventExitStatus=3) не перезапускает
+    сервис каждые 10 секунд.
     """
-    src = _load_source()
+    try:
+        src = _load_source()
+    except EASConfigError as e:
+        log.error("eas-watch не запускаю: %s. Выход с кодом 3, без перезапуска", e)
+        return {"source": SOURCE_ID, "status": "config", "error": str(e)}
     if not src.get("enabled") and not kw.get("force"):
-        return {"source": SOURCE_ID, "status": "disabled",
-                "message": "источник eas:alfa выключен (work.sources.enabled = false)"}
+        msg = "источник eas:alfa выключен (work.sources.enabled = false)"
+        log.warning("eas-watch не запускаю: %s. Выход с кодом 3, systemd не перезапускает. Включи источник "
+                    "и запусти сервис заново: systemctl restart workos-eas", msg)
+        return {"source": SOURCE_ID, "status": "disabled", "message": msg}
     own_client = client is None
-    cl = client or client_from_env()
+    try:
+        cl = client or client_from_env()
+    except EASConfigError as e:
+        log.error("eas-watch не запускаю, не хватает настроек: %s. Выход с кодом 3, без перезапуска; "
+                  "заполни .env.reader и запусти systemctl restart workos-eas", e)
+        return {"source": SOURCE_ID, "status": "config", "error": str(e)}
     flags = {"stop": False, "critical": False}
 
     def on_signal(signum, frame):
@@ -1505,7 +1629,8 @@ def main(argv: list[str] | None = None) -> int:
         if a.watch:
             res = watch()
             print(res)
-            return 3 if res.get("status") == "fatal" else 0
+            # 3 = «перезапуск не поможет» (RestartPreventExitStatus=3 в workos-eas.service)
+            return 3 if res.get("status") in ("fatal", "disabled", "config") else 0
         print(run(dry_run=a.dry_run, force=True))
         return 0
     except EASError as e:

@@ -14,7 +14,7 @@ EXEC_STATE_DIR=/var/lib/workos-exec
 # --- фаза 5 ---
 TRELLO_KEY=
 TRELLO_WRITE_TOKEN=
-# TRELLO_DRAFT_LIST_ID=
+TRELLO_DRAFT_LIST_ID=             # список «Черновики»: без него «Оставить черновиком» для Trello не сработает
 SLACK_WRITE_TOKEN=
 # GMAIL_WRITE_TOKENS={"personal":"GOOGLE_WRITE_REFRESH_TOKEN"}
 # MANUAL_DRAFT_ACCOUNTS=alfa,eas:alfa

@@ -6,6 +6,11 @@
 на инцидент (дедуп через work.notices 'health:<источник>'). Когда источник ожил,
 отметка снимается и приходит «восстановился».
 
+Бэкап: deploy/backup.sh после удачного прогона пишет в work.notices 'backup:<дата>'.
+Если такая отметка была хоть раз (таймер бэкапа включён), а самая свежая старше 26 часов,
+в «Систему» уходит алерт (инцидент 'health:backup'). Ни одной отметки: бэкап ещё не включён,
+молчим.
+
 Плюс проверка API мини-приложения (APP_HEALTH_URL). Смерть самого бота отсюда не видна
 (алерты идут через него): залежавшийся outbox только пишется в лог, а падение бота
 ловит внешний сторож healthchecks.io, которого пингует бот.
@@ -25,6 +30,7 @@ log = logging.getLogger("workos.health")
 THRESHOLD_HOURS = {"achat": 26.0, "eas": 1.0}   # Мак спит ночью: сутки без А-Чата не тревога
 DEFAULT_HOURS = 1.0
 STALE_OUTBOX_MIN = 30
+BACKUP_HOURS = 26.0
 
 
 def threshold(src: dict) -> float:
@@ -74,6 +80,18 @@ def _incident(conn, key: str, name: str, issue: str | None) -> str | None:
     return None
 
 
+def backup_problem(conn, now: datetime) -> tuple[bool, str | None]:
+    """(включён ли бэкап, текст проблемы). Включён = была хоть одна отметка 'backup:<дата>'."""
+    last = conn.execute("SELECT max(sent_at) AS t FROM work.notices WHERE key LIKE %s",
+                        ("backup:%",)).fetchone()["t"]
+    if last is None:
+        return False, None
+    if now - last > timedelta(hours=BACKUP_HOURS):
+        return True, (f"последний удачный бэкап {_ago(now, last)} назад ({_when(last)}), "
+                      f"смотри <code>journalctl -u workos-backup</code>")
+    return True, None
+
+
 def check_app(url: str, transport=None) -> str | None:
     try:
         with httpx.Client(timeout=5.0, transport=transport) as c:
@@ -101,6 +119,9 @@ def run(date: str | None = None, dry_run: bool = False, now: datetime | None = N
         sources = conn.execute("SELECT id, kind, last_ok_at, last_error, config FROM work.sources "
                                "WHERE enabled AND kind <> 'telegram' ORDER BY id").fetchall()
         checks = [(f"health:{s['id']}", s["id"], problem(s, now)) for s in sources]
+        enabled, issue = backup_problem(conn, now)
+        if enabled:
+            checks.append(("health:backup", "Бэкап базы", issue))
         url = config.env("APP_HEALTH_URL", "http://127.0.0.1:8787/api/health")
         if url and url.lower() not in ("off", "none", "0"):
             checks.append(("health:app", "Мини-приложение", check_app(url, transport)))

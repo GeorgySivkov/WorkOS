@@ -1,7 +1,9 @@
 """Исполнитель trello_card (шаг 5.2): карточка в формате George.
 
 .env.executor: TRELLO_KEY, TRELLO_WRITE_TOKEN (токен с правом write),
-TRELLO_DRAFT_LIST_ID (необязательно): куда класть «Оставить черновиком».
+TRELLO_DRAFT_LIST_ID: куда класть «Оставить черновиком». Без него черновик не
+создаётся (действие failed с понятной причиной): класть «[черновик]» в рабочий
+список команды значит публиковать то, что George не отправлял.
 Ключ и токен уходят заголовком Authorization, а не в URL, чтобы не попасть в логи.
 """
 from __future__ import annotations
@@ -12,7 +14,6 @@ from core import config
 from executors import base
 
 API = "https://api.trello.com/1"
-DRAFT_PREFIX = "[черновик] "
 
 
 def _client() -> httpx.Client:
@@ -45,10 +46,11 @@ def execute(action: dict, notify) -> dict:
     drafted = action["status"] == "drafted"
     if drafted:
         draft_list = config.env("TRELLO_DRAFT_LIST_ID")
-        if draft_list:
-            list_id = draft_list
-        else:
-            name = DRAFT_PREFIX + name
+        if not draft_list:
+            raise base.ExecError("черновик Trello не создан: не задан TRELLO_DRAFT_LIST_ID (личный "
+                                 "список для черновиков в .env.executor), а в рабочий список команды "
+                                 "черновики не кладу")
+        list_id = draft_list
 
     with _client() as http:
         label_ids, unknown = [], []

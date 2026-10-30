@@ -9,7 +9,8 @@
   write       calendar.events + gmail.compose     -> .env.executor (GOOGLE_WRITE_REFRESH_TOKEN)
 
 Скрипт поднимает локальный порт, открывает браузер, ловит код и печатает
-refresh_token. Ничего не сохраняет на диск. Без зависимостей, кроме httpx.
+refresh_token. Ничего не сохраняет на диск. Только стандартная библиотека: системный
+python3 на Маке подходит как есть, venv не нужен.
 """
 from __future__ import annotations
 
@@ -17,10 +18,10 @@ import argparse
 import http.server
 import json
 import secrets
+import urllib.error
 import urllib.parse
+import urllib.request
 import webbrowser
-
-import httpx
 
 SCOPES = {
     "read-gmail": ["https://www.googleapis.com/auth/gmail.readonly"],
@@ -65,13 +66,26 @@ def main() -> None:
         srv.handle_request()
     if got.get("state") != state or "code" not in got:
         raise SystemExit(f"не получилось: {got}")
-    r = httpx.post("https://oauth2.googleapis.com/token", data={
-        "code": got["code"], "client_id": cfg["client_id"], "client_secret": cfg["client_secret"],
-        "redirect_uri": redirect, "grant_type": "authorization_code",
-    })
-    r.raise_for_status()
-    tok = r.json()
+    tok = exchange(cfg, got["code"], redirect)
+    if "refresh_token" not in tok:
+        raise SystemExit("Google не вернул refresh_token: отзови доступ приложения в myaccount.google.com "
+                         "→ Безопасность → Сторонние приложения и запусти ещё раз")
     print("\nrefresh_token (положи в .env, никому не показывай):\n" + tok["refresh_token"])
+
+
+def exchange(cfg: dict, code: str, redirect: str, opener=urllib.request.urlopen) -> dict:
+    """Код авторизации -> токены (POST form на oauth2.googleapis.com/token, только stdlib)."""
+    data = urllib.parse.urlencode({
+        "code": code, "client_id": cfg["client_id"], "client_secret": cfg["client_secret"],
+        "redirect_uri": redirect, "grant_type": "authorization_code",
+    }).encode()
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data, method="POST",
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with opener(req, timeout=30) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"Google ответил {e.code}: {e.read().decode(errors='replace')[:300]}") from e
 
 
 if __name__ == "__main__":

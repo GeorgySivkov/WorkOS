@@ -42,6 +42,11 @@ class FakeTG:
         self.threads = itertools.count(501)
         self.file_bytes = b"voice"
         self.updates: list[dict] = []
+        self.fail = None          # fn(method, form) -> httpx.Response | None: подставить ошибку
+
+    @staticmethod
+    def error(code: int, desc: str) -> httpx.Response:
+        return httpx.Response(code, json={"ok": False, "error_code": code, "description": desc})
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -52,6 +57,10 @@ class FakeTG:
         for k in JSON_KEYS & form.keys():
             form[k] = json.loads(form[k])
         self.calls.append((method, form))
+        if self.fail:
+            bad = self.fail(method, form)
+            if bad is not None:
+                return bad
         if method == "createForumTopic":
             if not self.topics:
                 return httpx.Response(400, json={"ok": False, "error_code": 400,
@@ -381,6 +390,7 @@ def test_plan_bridge_select_subset(term, tg, admin, clock):
     assert [i["title"] for i in p["items"]] == ["Отчёт по SDK", "Созвон с Яном", "Купить корм"]
     assert p["items"][0]["size"] == "M" and p["items"][1]["size"] == "M"
     assert p["items"][1]["start"] == tu.at_local(date(2026, 10, 23), dtime(10)).isoformat()
+    assert p["items"][1]["fixed"] is True and "fixed" not in p["items"][0]
     assert [i["title"] for i in p["week_items"]] == ["Разобрать почту"]
     assert int(card["message_thread_id"]) == term.ctx.thread_of("plan")
     assert "3 задачи на пт, 23 октября" in card["text"]
@@ -401,7 +411,7 @@ def test_plan_bridge_select_subset(term, tg, admin, clock):
     assert all(t["source"] == "plan" and t["action_id"] == act["id"] for t in tasks)
     assert tasks[0]["due"] == date(2026, 10, 23) and tasks[0]["planned_start"] is None
     assert tasks[1]["planned_start"] == tu.at_local(date(2026, 10, 23), dtime(10))
-    assert tasks[1]["planned_by"] == "auto"
+    assert tasks[1]["planned_by"] == "manual"          # время George написал сам: replan его не двигает
     assert tasks[2]["due"] is None and tasks[2]["week_of"] == date(2026, 10, 19)
     a2 = admin.execute("SELECT status, approved_hash, result, " + H + " AS h FROM work.actions").fetchone()
     assert a2["status"] == "executed" and a2["approved_hash"] == a2["h"]
@@ -446,10 +456,11 @@ def test_plan_hash_mismatch_refused(term, tg, admin, clock):
     assert "одобрение не принято" in tg.last("answerCallbackQuery")["text"]
     new_card = tg.last("sendMessage")                 # новая карточка с новым текстом и хешем
     assert "Удалить прод" in new_card["text"]
-    r = admin.execute(f"SELECT left({H}, 8) AS h, approved_hash, {H} AS full FROM work.actions").fetchone()
-    assert f"pb:{act['id']}:ok:{r['h']}" in buttons(new_card) and r["approved_hash"] == r["full"]
+    r = admin.execute(f"SELECT left({H}, 8) AS h, shown_hash, approved_hash, {H} AS full FROM work.actions").fetchone()
+    assert f"pb:{act['id']}:ok:{r['h']}" in buttons(new_card) and r["shown_hash"] == r["full"]
+    assert r["approved_hash"] is None                 # показ карточки не одобряет
     # старая кнопка с тем же h8, что у нового текста, не пройдёт без совпадения полного хеша
-    admin.execute("UPDATE work.actions SET approved_hash = 'x' || approved_hash")
+    admin.execute("UPDATE work.actions SET shown_hash = 'x' || shown_hash")
     new_id = admin.execute("SELECT tg_message_id FROM work.outbox ORDER BY id DESC").fetchone()["tg_message_id"]
     press(term, f"pb:{act['id']}:ok:{r['h']}", new_id)
     assert admin.execute("SELECT status FROM work.actions").fetchone()["status"] == "proposed"
@@ -599,15 +610,17 @@ def test_auto_action_notice_and_rollback(term, tg, admin):
 def test_manual_switch_sends_auto_to_cards(term, tg, admin):
     admin.execute("INSERT INTO work.autonomy (action_type, context_id, mode) VALUES ('plan_batch', '*', 'auto')")
     send(term, message(term, "/manual", topic="system"))
-    a = admin.execute("SELECT mode, locked FROM work.autonomy").fetchone()
+    a = admin.execute("SELECT mode, locked FROM work.autonomy WHERE action_type = 'plan_batch'").fetchone()
     assert a["mode"] == "approval" and a["locked"] is True
+    g = admin.execute("SELECT locked FROM work.autonomy WHERE action_type = '*' AND context_id = '*'").fetchone()
+    assert g["locked"] is True                             # общий рубильник заведён и заперт
     assert "Ручной режим" in tg.last("sendMessage")["text"]
     aid = _propose(admin, "plan_batch", AUTO_PLAN, autonomy="auto", ctx_id="personal")
     out = term.tick(force=True)
     assert out["cards"] == {"cards": 1, "auto": 0}
     assert admin.execute("SELECT status FROM work.actions WHERE id=%s", (aid,)).fetchone()["status"] == "proposed"
     send(term, message(term, "/auto", topic="system"))
-    assert admin.execute("SELECT locked FROM work.autonomy").fetchone()["locked"] is False
+    assert [r["locked"] for r in admin.execute("SELECT locked FROM work.autonomy")] == [False, False]
 
 
 def test_external_auto_never_auto(term, admin):
@@ -615,6 +628,144 @@ def test_external_auto_never_auto(term, admin):
     _propose(admin, autonomy="auto")
     assert term.tick(force=True)["cards"] == {"cards": 1, "auto": 0}
     assert admin.execute("SELECT status FROM work.actions").fetchone()["status"] == "proposed"
+
+
+def test_auto_sampling_every_fifth_is_a_card(term, admin):
+    admin.execute("INSERT INTO work.autonomy (action_type, context_id, mode) VALUES ('plan_batch', '*', 'auto')")
+    for i in range(5):
+        _propose(admin, "plan_batch", {**AUTO_PLAN, "for_date": f"2026-10-2{i}"}, ctx_id="personal")
+    assert term.tick(force=True)["cards"] == {"cards": 1, "auto": 4}
+    assert admin.execute("SELECT auto_count FROM work.autonomy").fetchone()["auto_count"] == 5
+    st = [r["status"] for r in admin.execute("SELECT status FROM work.actions ORDER BY id")]
+    assert st == ["executed"] * 4 + ["proposed"]
+
+
+def test_task_add_night_time_is_next_calendar_day(term, tg, admin):
+    a1 = _propose(admin, "task_add", {"title": "Таблетка", "due": "2026-10-22", "time": "02:30", "size": "S"},
+                  ctx_id="personal")
+    a2 = _propose(admin, "task_add", {"title": "Созвон", "due": "2026-10-22", "time": "10:00", "size": "S"},
+                  ctx_id="personal")
+    term.tick(force=True)
+    for aid in (a1, a2):
+        h8 = admin.execute(f"SELECT left({H}, 8) AS h FROM work.actions WHERE id=%s", (aid,)).fetchone()["h"]
+        press(term, f"act:{aid}:ok:{h8}", _card_of(admin, aid)["tg_message_id"])
+    t = {r["title"]: r for r in admin.execute("SELECT * FROM work.tasks")}
+    assert t["Таблетка"]["due"] == date(2026, 10, 22)
+    assert t["Таблетка"]["remind_at"] == tu.at_local(date(2026, 10, 23), dtime(2, 30))
+    assert t["Созвон"]["remind_at"] == tu.at_local(date(2026, 10, 22), dtime(10))
+
+
+def test_truncated_card_offers_only_fix_and_reject(term, tg, admin):
+    long = {"list_id": "L1", "name": "Отчёт", "desc": "Очень длинно. " * 400, "labels": []}
+    aid = _propose(admin, "trello_card", long)
+    term.tick(force=True)
+    card = tg.last("sendMessage")
+    h8 = admin.execute(f"SELECT left({H}, 8) AS h FROM work.actions").fetchone()["h"]
+    assert set(buttons(card)) == {f"act:{aid}:fix:{h8}", f"act:{aid}:no:{h8}"}
+    assert "показан не целиком" in card["text"] and "—" not in card["text"]
+    # кнопку черновика с той же карточки подделать нельзя: обрезанное не одобряется
+    press(term, f"act:{aid}:dr:{h8}", _card_of(admin, aid)["tg_message_id"])
+    assert admin.execute("SELECT status FROM work.actions").fetchone()["status"] == "proposed"
+    assert "не целиком" in tg.last("answerCallbackQuery")["text"]
+    # «Назад» из меню правки тоже без «Отправить» и «черновика»
+    press(term, f"act:{aid}:bk:{h8}", _card_of(admin, aid)["tg_message_id"])
+    assert set(buttons(tg.last("editMessageText"))) == {f"act:{aid}:fix:{h8}", f"act:{aid}:no:{h8}"}
+
+
+def test_cards_show_trello_list_and_gmail_thread(term, tg, admin):
+    admin.execute("""INSERT INTO work.events (context_id, source_id, external_id, kind, occurred_at, title, meta)
+                     VALUES ('infatica', 'telegram:inbox', 'trello-x', 'card', now(), 'x',
+                             '{"list_id": "L1", "list": "Backlog", "board": "SDK"}')""")
+    _propose(admin, "trello_card", {"list_id": "L1", "name": "Отчёт", "desc": "кратко", "labels": []})
+    _propose(admin, "trello_card", {"list_id": "L2", "name": "Другое", "desc": "кратко", "labels": []})
+    _propose(admin, payload={**EMAIL, "thread_id": "18c2f00dbeef"})
+    _propose(admin, payload=EMAIL)
+    term.tick(force=True)
+    texts = [p["text"] for p in tg.of("sendMessage")]
+    assert any("Список: SDK / Backlog" in t and "L1" in t for t in texts)
+    assert any("Список: <code>L2</code>" in t for t in texts)
+    assert any("Ветка Gmail: <code>18c2f00dbeef</code>" in t for t in texts)
+    assert any("Ветка Gmail: новое письмо" in t for t in texts)
+
+
+def test_plan_task_id_moves_existing_and_skips_closed(term, tg, admin, clock):
+    s0 = tu.at_local(date(2026, 10, 22), dtime(11))
+    open_id = admin.execute("""INSERT INTO work.tasks (title, due, source, planned_start, planned_end, planned_by,
+                                                       planned_at)
+                               VALUES ('Старое', '2026-10-21', 'plan', %s, %s, 'auto', '2026-10-01')
+                               RETURNING id""", (s0, s0 + (tu.at_local(date(2026, 10, 22), dtime(12)) - s0))).fetchone()["id"]
+    done_id = admin.execute("""INSERT INTO work.tasks (title, due, source, done_at)
+                               VALUES ('Сделано', '2026-10-21', 'plan', now()) RETURNING id""").fetchone()["id"]
+    payload = {"for_date": "2026-10-22", "week_items": [], "items": [
+        {"title": "Старое", "size": "M", "task_id": open_id, "start": s0.isoformat(),
+         "end": tu.at_local(date(2026, 10, 22), dtime(12)).isoformat()},
+        {"title": "Сделано", "size": "S", "task_id": done_id},
+        {"title": "Пропавшая", "size": "S", "task_id": 999999},
+        {"title": "Новая", "size": "S"}]}
+    aid = _propose(admin, "plan_batch", payload, ctx_id="personal")
+    term.tick(force=True)
+    card = tg.last("sendMessage")
+    assert card["text"].count("перенос") == 3 and "Новая · S\n" not in card["text"].replace("перенос", "")
+    press(term, btn_by_prefix(card, f"pb:{aid}:ok:"), _card_of(admin, aid)["tg_message_id"])
+    tasks = {r["title"]: r for r in admin.execute("SELECT * FROM work.tasks")}
+    assert set(tasks) == {"Старое", "Сделано", "Пропавшая", "Новая"}       # дубля «Сделано» нет
+    assert tasks["Старое"]["due"] == date(2026, 10, 22) and tasks["Старое"]["planned_start"] == s0
+    assert tasks["Старое"]["planned_at"].date() == date(2026, 10, 1)       # время не менялось
+    assert tasks["Сделано"]["done_at"] is not None
+    res = admin.execute("SELECT result FROM work.actions").fetchone()["result"]
+    assert open_id in res["task_ids"] and done_id not in res["task_ids"] and len(res["task_ids"]) == 3
+
+
+def test_reminder_400_retries_without_web_app_and_never_blocks(term, tg, admin, clock):
+    clock.set(date(2026, 10, 22), 9)
+    for title, m in (("сломанное", 0), ("с кнопкой", 1), ("обычное", 2)):
+        admin.execute("INSERT INTO work.tasks (title, due, remind_at, source) VALUES (%s, '2026-10-22', %s, 'capture')",
+                      (title, tu.at_local(date(2026, 10, 22), dtime(8, m))))
+
+    def fail(method, form):
+        if method != "sendMessage" or "⏰" not in (form.get("text") or ""):
+            return None
+        if "сломанное" in form["text"]:
+            return FakeTG.error(400, "Bad Request: something is broken")
+        kb = (form.get("reply_markup") or {}).get("inline_keyboard") or []
+        if "с кнопкой" in form["text"] and any("web_app" in b for row in kb for b in row):
+            return FakeTG.error(400, "Bad Request: BUTTON_TYPE_INVALID")
+        return None
+    tg.fail = fail
+    assert terminal.reminders(term.ctx) == 2
+    rows = {r["title"]: r for r in admin.execute("SELECT title, reminded_at FROM work.tasks")}
+    assert all(r["reminded_at"] is not None for r in rows.values())     # кривое не держит очередь
+    sys_msgs = [r["text"] for r in admin.execute("SELECT text FROM work.outbox WHERE topic = 'system'")]
+    assert any("сломанное" in t and "не ушло" in t for t in sys_msgs)
+    tries = {}
+    for p in tg.of("sendMessage"):
+        if "⏰" in p["text"]:
+            kb = p["reply_markup"]["inline_keyboard"]
+            tries.setdefault(p["text"].split("\n")[0], []).append(any("web_app" in b for r in kb for b in r))
+    # сломанное: с кнопкой и без, обе мимо; с кнопкой: второй раз без web_app; обычное: с первого раза
+    assert tries == {"⏰ сломанное": [True, False], "⏰ с кнопкой": [True, False], "⏰ обычное": [True]}
+
+    # 429: пауза, ничего не помечено отправленным
+    admin.execute("UPDATE work.tasks SET reminded_at = NULL WHERE title = 'обычное'")
+    tg.fail = lambda method, form: (FakeTG.error(429, "Too Many Requests: retry after 7")
+                                    if method == "sendMessage" else None)
+    assert terminal.reminders(term.ctx) == 0
+    assert admin.execute("SELECT reminded_at FROM work.tasks WHERE title = 'обычное'").fetchone()["reminded_at"] is None
+    assert term.ctx.state["outbox_backoff"] > time.monotonic() + 5
+    tg.fail = None
+    assert terminal.reminders(term.ctx) == 0                          # ждёт паузу
+    term.ctx.state["outbox_backoff"] = 0
+    assert terminal.reminders(term.ctx) == 1
+
+
+def test_tomorrow_shifts_reminder_by_days(term, tg, admin, clock):
+    clock.set(date(2026, 10, 22), 23, 30)
+    tid = admin.execute("""INSERT INTO work.tasks (title, due, remind_at, source)
+                           VALUES ('вечернее', '2026-10-22', %s, 'capture') RETURNING id""",
+                        (tu.at_local(date(2026, 10, 22), dtime(23)),)).fetchone()["id"]
+    press(term, f"tk:{tid}:tmr", 4243)
+    t = admin.execute("SELECT due, remind_at FROM work.tasks").fetchone()
+    assert t["due"] == date(2026, 10, 23) and t["remind_at"] == tu.at_local(date(2026, 10, 23), dtime(23))
 
 
 # ---------------- 1.4: напоминания и outbox ----------------

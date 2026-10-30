@@ -11,10 +11,16 @@ WorkingDirectory=/opt/workos
 Environment=WORKOS_ROLE=reader
 Environment=HOME=/var/lib/workos-reader
 Environment=PYTHONUNBUFFERED=1
+# claude CLI пишет в ~/.claude, ~/.cache, ~/.config: это /var/lib/<user>, он в ReadWritePaths;
+# сам себя не обновляет (/usr только на чтение)
+Environment=DISABLE_AUTOUPDATER=1
 ExecStart=/opt/workos/.venv/bin/python workctl.py %i
-TimeoutStartSec=20min
+# с запасом: команда может ждать замок модели до 15 минут (workctl.LLM_LOCK)
+TimeoutStartSec=45min
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/workos-reader /tmp
 PrivateTmp=true
+ProtectProc=invisible
+# ProcSubset=pid не ставим: claude CLI (node), onnxruntime и whisper читают /proc/meminfo и /proc/cpuinfo

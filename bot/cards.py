@@ -3,9 +3,15 @@
 Правила, на которых держится безопасность:
 - одобрение приходит только из нажатия кнопки (terminal пускает callback только
   с user id George), ответ модели до этих обработчиков не доходит;
-- хеш payload считается SQL-выражением в момент показа карточки, первые 8 hex
-  едут в callback, а при нажатии UPDATE проходит только если хеш текущего
-  payload совпал: текста, которого George не видел, исполнитель не получит;
+- хеш payload считается SQL-выражением в момент показа карточки и пишется в
+  shown_hash, первые 8 hex едут в callback; при нажатии UPDATE проходит только
+  если хеш текущего payload равен shown_hash и префиксу на кнопке, и только тогда
+  ставится approved_hash: текста, которого George не видел, исполнитель не получит;
+- нажатие одобрения принимается только с сообщения, чья строка outbox создана
+  самим ботом и ссылается на это действие (is_card);
+- без нажатия бот одобряет только внутренние типы (AUTO_ALLOWED) и только по своей
+  выборке из work.autonomy, actions.autonomy (его пишет предлагающий) не читается;
+- обрезанную карточку нельзя ни отправить, ни оставить черновиком;
 - «Поправить» не меняет строку, а создаёт новую (replaces) со своей карточкой.
 
 callback_data: act:<id>:ok|dr|no|fix|bk:<h8> · act:<id>:fx:short|formal|cut|tomorrow · rb:<id>
@@ -28,6 +34,9 @@ log = logging.getLogger("workos.bot")
 
 H = db.payload_hash_sql("payload")
 INTERNAL = {"plan_batch", "task_add"}          # исполняет сам бот
+# без нажатия бывают только внутренние типы: инъекция в письме или расшифровке
+# не должна дойти до общей доски Trello или чужого ящика без кнопки George
+AUTO_ALLOWED = frozenset({"plan_batch", "task_add"})
 MAX_CARD = 3800
 TYPE_LABEL = {
     "email_reply": "Ответ на письмо",
@@ -72,22 +81,27 @@ def outcome(conn, row: dict, verdict: str, diff: str | None = None) -> None:
 def approve(conn, aid: int, h8: str | None, status: str = "approved", auto: bool = False) -> dict | None:
     """Одобрение одним UPDATE: хеш считается и сверяется в SQL по текущему payload.
 
-    При показе карточки полный хеш показанного payload кладётся в approved_hash
-    (кандидат), первые 8 hex едут в callback. Одобрение проходит, только если
-    хеш текущего payload равен сохранённому целиком, а его префикс — тому, что
-    на нажатой кнопке. auto=True: автономный путь, одобряется то, что лежит сейчас.
+    При показе карточки полный хеш показанного payload кладётся в shown_hash,
+    первые 8 hex едут в callback. Одобрение проходит, только если хеш текущего
+    payload равен shown_hash целиком, а префикс shown_hash равен тому, что на
+    нажатой кнопке; тогда же ставится approved_hash (его и сверяет исполнитель).
+    auto=True: автономный путь, только внутренние типы, одобряется то, что лежит сейчас
+    (бот сразу исполняет это сам в той же транзакции).
     """
-    cond = ("AND autonomy = 'auto'" if auto
-            else f"AND approved_hash = {H} AND left(approved_hash, 8) = %(h8)s")
-    if not auto and not h8:
-        return None
+    if auto:
+        cond = "AND type = ANY(%(allowed)s)"
+    else:
+        if not h8:
+            return None
+        cond = f"AND shown_hash = {H} AND left(shown_hash, 8) = %(h8)s"
     return conn.execute(
         f"""UPDATE work.actions
                SET status = %(st)s, approved_hash = {H}, approval_nonce = %(nonce)s,
                    approved_at = now(), decided_at = now()
              WHERE id = %(id)s AND status = 'proposed' {cond}
          RETURNING id, type, context_id, payload, rationale, approved_hash""",
-        {"st": status, "nonce": secrets.token_hex(16), "id": aid, "h8": h8}).fetchone()
+        {"st": status, "nonce": secrets.token_hex(16), "id": aid, "h8": h8,
+         "allowed": sorted(AUTO_ALLOWED)}).fetchone()
 
 
 # ---------- задачи из внутренних действий ----------
@@ -129,11 +143,18 @@ def insert_task_add(conn, row: dict) -> list[int]:
         """INSERT INTO work.tasks (context_id, title, due, remind_at, size, cell_id, source, action_id)
            VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         (ctx_id, str(p.get("title") or "Без названия")[:300], due,
-         tu.at_local(due, at) if due and at else None,
+         remind_at(due, at),
          p.get("size") if p.get("size") in ("S", "M", "L") else "S",
          p.get("cell_id") if p.get("cell_id") in cl else None,
          "commitment" if p.get("commitment_id") else "plan", row["id"])).fetchone()["id"]
     return [tid]
+
+
+def remind_at(due: date | None, at: time | None) -> datetime | None:
+    """Время логического дня due: 00:00-03:59 уже следующая календарная дата."""
+    if not due or not at:
+        return None
+    return tu.at_local(due + timedelta(days=1) if at.hour < config.LOGICAL_DAY_END_HOUR else due, at)
 
 
 def execute_internal(conn, row: dict, selected: list[int] | None = None) -> list[int]:
@@ -153,7 +174,23 @@ def _join(v) -> str:
     return ", ".join(str(x) for x in v) if isinstance(v, (list, tuple)) else str(v or "")
 
 
-def _lines(atype: str, p: dict) -> list[str]:
+def trello_list_name(conn, list_id) -> str | None:
+    """Имя списка (и доски) по событиям коллектора Trello; None, если таких карточек не видели."""
+    if conn is None or not list_id:
+        return None
+    try:
+        with conn.transaction():          # точка сохранения: сбой подписи не ломает карточку
+            r = conn.execute("""SELECT meta->>'board' AS board, meta->>'list' AS list FROM work.events
+                                WHERE meta @> jsonb_build_object('list_id', %s::text)
+                                ORDER BY occurred_at DESC LIMIT 1""", (str(list_id),)).fetchone()
+    except Exception:
+        return None
+    if not r or not r["list"] or r["list"] == str(list_id):
+        return None
+    return f"{r['board']} / {r['list']}" if r["board"] else r["list"]
+
+
+def _lines(atype: str, p: dict, conn=None) -> list[str]:
     if atype in ("email_reply", "email_send"):
         out = []
         if p.get("account"):
@@ -162,10 +199,15 @@ def _lines(atype: str, p: dict) -> list[str]:
         if p.get("cc"):
             out.append("Копия: " + esc(_join(p["cc"])))
         out.append(f"Тема: <b>{esc(p.get('subject'))}</b>")
+        out.append(f"Ветка Gmail: <code>{esc(p['thread_id'])}</code>" if p.get("thread_id")
+                   else "Ветка Gmail: новое письмо, не ответ в ветке")
         out += ["", esc(p.get("body"))]
         return out
     if atype == "trello_card":
-        out = [f"<b>{esc(p.get('name'))}</b>"]
+        name = trello_list_name(conn, p.get("list_id"))
+        out = ["Список: " + (f"{esc(name)} (<code>{esc(p.get('list_id'))}</code>)" if name
+                             else f"<code>{esc(p.get('list_id'))}</code>"),
+               f"<b>{esc(p.get('name'))}</b>"]
         if p.get("desc"):
             out.append(esc(p["desc"]))
         if p.get("labels"):
@@ -196,7 +238,7 @@ def card_text(conn, row: dict) -> tuple[str, bool]:
     parts = [head]
     if row.get("rationale"):
         parts.append(f"<i>{esc(row['rationale'])}</i>")
-    body = "\n".join(_lines(row["type"], row["payload"] or {}))
+    body = "\n".join(_lines(row["type"], row["payload"] or {}, conn))
     text = "\n".join(parts) + "\n\n" + body
     if len(text) <= MAX_CARD:
         return text, False
@@ -204,19 +246,24 @@ def card_text(conn, row: dict) -> tuple[str, bool]:
     cut = cut[:cut.rfind("\n")] if "\n" in cut[-300:] else cut
     # закрытые теги не гарантированы после обрезки: убираем разметку из хвоста
     from bot.topics import strip_tags
-    return (esc(strip_tags(cut)) + "\n…\n<i>Текст длинный: целиком он будет в черновике, "
-            "отправить отсюда нельзя.</i>"), True
+    return (esc(strip_tags(cut)) + "\n…\n" + TRUNCATED_NOTE), True
+
+
+TRUNCATED_NOTE = ("<i>Текст длинный и показан не целиком: ни отправить, ни оставить черновиком "
+                  "нельзя. «Поправить» → «Короче», или «Отклонить».</i>")
 
 
 def main_buttons(row: dict, h8: str, truncated: bool = False) -> list:
     i = row["id"]
+    if truncated:
+        # непоказанный текст никуда не уходит: ни отправкой, ни черновиком (черновик Trello
+        # виден команде), только сократить или отклонить
+        return [[btn("Поправить", f"act:{i}:fix:{h8}"), btn("Отклонить", f"act:{i}:no:{h8}")]]
     if row["type"] == "task_add":
         return [[btn("В список", f"act:{i}:ok:{h8}"), btn("Не надо", f"act:{i}:no:{h8}")],
                 [btn("Поправить", f"act:{i}:fix:{h8}")]]
-    first = [btn("Оставить черновиком", f"act:{i}:dr:{h8}")]
-    if not truncated:
-        first.insert(0, btn("Отправить", f"act:{i}:ok:{h8}"))
-    return [first, [btn("Поправить", f"act:{i}:fix:{h8}"), btn("Отклонить", f"act:{i}:no:{h8}")]]
+    return [[btn("Отправить", f"act:{i}:ok:{h8}"), btn("Оставить черновиком", f"act:{i}:dr:{h8}")],
+            [btn("Поправить", f"act:{i}:fix:{h8}"), btn("Отклонить", f"act:{i}:no:{h8}")]]
 
 
 def fix_buttons(row: dict, h8: str) -> list:
@@ -240,8 +287,10 @@ def render(conn, row: dict) -> tuple[str, list]:
 
 # ---------- показ ----------
 def is_card(conn, aid: int, msg_id) -> bool:
-    """Одобрять можно только с карточки, которую нарисовал сам бот (не с чужой строки outbox)."""
-    if not msg_id:
+    """Одобрять можно только с карточки, которую нарисовал сам бот (не с чужой строки outbox).
+
+    created_by ставит триггер 009 (= роль, вставившая строку), подделать его нельзя."""
+    if not msg_id or aid is None:
         return False
     return conn.execute("""SELECT 1 FROM work.outbox WHERE tg_message_id = %s AND ref_action = %s
                            AND created_by = current_user""", (msg_id, aid)).fetchone() is not None
@@ -263,12 +312,13 @@ def post_card(ctx: Ctx, aid: int, direct: bool = False, force: bool = False) -> 
         if not force and _has_card(conn, aid):
             return None
         with conn.transaction():
-            # снимок: payload для текста и его хеш берутся одним UPDATE ... RETURNING
+            # снимок: payload для текста и его хеш берутся одним UPDATE ... RETURNING;
+            # approved_hash не трогаем, его ставит только нажатие (approve)
             row = conn.execute(
-                f"""UPDATE work.actions SET approved_hash = {H}
+                f"""UPDATE work.actions SET shown_hash = {H}
                     WHERE id = %s AND status = 'proposed'
                     RETURNING id, type, context_id, payload, rationale, status, autonomy, source_event,
-                              replaces, executed_at, result, approved_hash AS h, left(approved_hash, 8) AS h8""",
+                              replaces, executed_at, result, shown_hash AS h, left(shown_hash, 8) AS h8""",
                 (aid,)).fetchone()
             if not row:
                 return None
@@ -286,13 +336,38 @@ def post_card(ctx: Ctx, aid: int, direct: bool = False, force: bool = False) -> 
 
 
 # ---------- автономия ----------
-def auto_allowed(conn, atype: str, context_id: str) -> bool:
-    if atype in config.NEVER_AUTO:
-        return False
-    r = conn.execute("""SELECT mode, locked FROM work.autonomy
-                        WHERE action_type = %s AND context_id IN (%s, '*')
-                        ORDER BY (context_id = '*') LIMIT 1""", (atype, context_id)).fetchone()
-    return bool(r and r["mode"] == "auto" and not r["locked"])
+def auto_row(conn, atype: str, context_id: str | None) -> dict | None:
+    """Строка work.autonomy, по которой действие идёт без нажатия, или None.
+
+    Решает только эта выборка бота: своя строка (тип, контекст), иначе (тип, '*');
+    любой замок, включая общий рубильник ('*', '*'), значит подтверждение.
+    actions.autonomy не читается: его пишет тот, кто предлагает."""
+    if atype not in AUTO_ALLOWED or atype in config.NEVER_AUTO:
+        return None
+    cx = context_id or "*"
+    rows = conn.execute("""SELECT action_type, context_id, mode, locked FROM work.autonomy
+                           WHERE (action_type, context_id) IN ((%s, %s), (%s, '*'), ('*', '*'))""",
+                        (atype, cx, atype)).fetchall()
+    if any(r["locked"] for r in rows):
+        return None
+    own = [r for r in rows if r["action_type"] == atype and r["context_id"] == cx]
+    star = [r for r in rows if r["action_type"] == atype and r["context_id"] == "*"]
+    row = (own or star or [None])[0]
+    return row if row and row["mode"] == "auto" else None
+
+
+def auto_allowed(conn, atype: str, context_id: str | None) -> bool:
+    return auto_row(conn, atype, context_id) is not None
+
+
+def sampled(conn, row: dict) -> bool:
+    """Семплинг: каждое AUTONOMY_SAMPLE_EVERY-е автономное всё равно идёт карточкой,
+    иначе accept rate замирает и деградация не сработает никогда."""
+    r = conn.execute("""UPDATE work.autonomy SET auto_count = auto_count + 1
+                        WHERE action_type = %s AND context_id = %s RETURNING auto_count""",
+                     (row["action_type"], row["context_id"])).fetchone()
+    every = config.AUTONOMY_SAMPLE_EVERY
+    return bool(r and every and r["auto_count"] % every == 0)
 
 
 def auto_approve(ctx: Ctx, aid: int) -> bool:
@@ -324,14 +399,16 @@ def process_proposed(ctx: Ctx, limit: int = 20) -> dict:
     stats = {"cards": 0, "auto": 0}
     with ctx.lock:
         rows = conn.execute(
-            """SELECT a.id, a.type, a.context_id, a.autonomy FROM work.actions a
+            """SELECT a.id, a.type, a.context_id, a.replaces FROM work.actions a
                WHERE a.status = 'proposed' AND a.created_at <= now()
                  AND NOT EXISTS (SELECT 1 FROM work.outbox o
                                  WHERE o.ref_action = a.id AND o.created_by = current_user)
                ORDER BY a.id LIMIT %s""", (limit,)).fetchall()
         for r in rows:
             try:
-                if r["autonomy"] == "auto" and auto_allowed(conn, r["type"], r["context_id"]):
+                # поправленное George (replaces) всегда карточкой: он ждёт её увидеть
+                arow = None if r["replaces"] else auto_row(conn, r["type"], r["context_id"])
+                if arow is not None and not sampled(conn, arow):
                     if auto_approve(ctx, r["id"]):
                         stats["auto"] += 1
                         continue
@@ -385,6 +462,8 @@ def on_callback(ctx: Ctx, cq: dict, parts: list[str]) -> str | None:
             return "У задачи черновика не бывает"
         if not is_card(conn, aid, msg_id):
             return "Одобрить можно только с карточки действия"
+        if cur and cur["status"] == "proposed" and card_text(conn, cur)[1]:
+            return "Текст показан не целиком: сначала «Поправить» → «Короче»"
         with ctx.lock, conn.transaction():
             row = approve(conn, aid, arg, status=st)
             if row:
@@ -442,6 +521,8 @@ def on_rollback(ctx: Ctx, cq: dict, parts: list[str]) -> str | None:
     except (IndexError, ValueError):
         return "Не понял кнопку"
     msg_id = (cq.get("message") or {}).get("message_id")
+    if not is_card(conn, aid, msg_id):
+        return "Откатить можно только с уведомления бота"
     with ctx.lock, conn.transaction():
         row = fetch(conn, aid)
         if not row:
@@ -617,6 +698,7 @@ def on_fix_text(ctx: Ctx, msg: dict, allow_pending: bool = True) -> bool:
     rt = (msg.get("reply_to_message") or {}).get("message_id")
     if rt:
         r = conn.execute("""SELECT ref_action FROM work.outbox WHERE tg_message_id = %s AND ref_action IS NOT NULL
+                              AND created_by = current_user
                             ORDER BY id DESC LIMIT 1""", (rt,)).fetchone()
         if r:
             aid, old_msg = r["ref_action"], rt
@@ -637,17 +719,31 @@ def on_fix_text(ctx: Ctx, msg: dict, allow_pending: bool = True) -> bool:
 
 # ---------- рубильник ----------
 def manual(ctx: Ctx) -> str:
-    n = ctx.conn.execute("""UPDATE work.autonomy SET mode = 'approval', locked = true, changed_at = now(),
-                                   reason = '/manual' RETURNING action_type""").fetchall()
-    return (f"Ручной режим: {len(n)} {_types_word(len(n))} на подтверждении и заперты. "
-            "Автономные действия, которые ещё ждут, тоже придут карточками.")
+    """Всё на подтверждение и запереть, плюс общий рубильник ('*', '*'): он держит и типы,
+    у которых строки ещё нет, и не даёт разбору статистики двигать режимы."""
+    conn = ctx.conn
+    with ctx.lock, conn.transaction():
+        n = conn.execute("""UPDATE work.autonomy SET mode = 'approval', locked = true, changed_at = now(),
+                                   reason = '/manual'
+                            WHERE NOT (action_type = '*' AND context_id = '*')
+                            RETURNING action_type""").fetchall()
+        conn.execute("""INSERT INTO work.autonomy (action_type, context_id, mode, locked, changed_at, reason)
+                        VALUES ('*', '*', 'approval', true, now(), '/manual')
+                        ON CONFLICT (action_type, context_id)
+                        DO UPDATE SET mode = 'approval', locked = true, changed_at = now(), reason = '/manual'""")
+    return (f"Ручной режим: {len(n)} {_types_word(len(n))} на подтверждении и заперты, общий рубильник "
+            "включён. Автономные действия, которые ещё ждут, тоже придут карточками. Снять: /auto.")
 
 
 def auto(ctx: Ctx) -> str:
-    n = ctx.conn.execute("""UPDATE work.autonomy SET locked = false, changed_at = now(), reason = '/auto'
-                            WHERE locked RETURNING action_type""").fetchall()
-    return (f"Разблокировал {len(n)} {_types_word(len(n))}. В автономию их вернёт разбор статистики "
-            "(не меньше 20 решений и accept rate выше 0,85), внешние типы туда не попадают никогда.")
+    conn = ctx.conn
+    with ctx.lock, conn.transaction():
+        n = conn.execute("""UPDATE work.autonomy SET locked = false, changed_at = now(), reason = '/auto'
+                            WHERE locked RETURNING action_type, context_id""").fetchall()
+    k = sum(1 for r in n if r["action_type"] != "*")
+    return (f"Разблокировал {k} {_types_word(k)} и общий рубильник. В автономию их вернёт разбор статистики "
+            "(не меньше 20 решений и accept rate выше 0,85), и только план и задачи: внешние типы "
+            "без подтверждения не бывают никогда.")
 
 
 def _types_word(n: int) -> str:

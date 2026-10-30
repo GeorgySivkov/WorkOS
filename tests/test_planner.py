@@ -6,6 +6,7 @@ from datetime import date, time, timedelta
 
 import pytest
 
+from agents import scheduler as real_scheduler
 from core import config, llm, timeutil as tu
 
 
@@ -52,6 +53,7 @@ def _stub_busy(conn, day):
 def sched(monkeypatch):
     mod = types.ModuleType("agents.scheduler")
     mod.place, mod.busy_from_feed = _stub_place, _stub_busy
+    mod.fixed_slot = real_scheduler.fixed_slot          # чистая функция, без базы
     mod.replan = lambda conn, day, now: {}
     monkeypatch.setitem(sys.modules, "agents.scheduler", mod)
     monkeypatch.setitem(sys.modules, "agents.autonomy", None)
@@ -76,7 +78,12 @@ def test_logical_tomorrow():
     from agents import planner
     assert planner.target_date(at(2026, 10, 23, 0, 30)) == date(2026, 10, 23)
     assert planner.target_date(at(2026, 10, 22, 23, 50)) == date(2026, 10, 23)
-    assert planner.target_date(at(2026, 10, 23, 9)) == date(2026, 10, 24)
+    assert planner.target_date(at(2026, 10, 22, 18)) == date(2026, 10, 23)      # вечером ручной запуск: завтра
+    # догоняющий запуск днём (Persistent после ребута, ручной старт): уже начавшийся день
+    assert planner.target_date(at(2026, 10, 23, 7)) == date(2026, 10, 23)
+    assert planner.target_date(at(2026, 10, 23, 9)) == date(2026, 10, 23)
+    assert planner.target_date(at(2026, 10, 23, 4)) == date(2026, 10, 23)
+    assert planner.target_date(at(2026, 10, 23, 3, 59)) == date(2026, 10, 23)
 
 
 def test_planner_outbox_and_plan_batch(admin, role_env):
@@ -200,18 +207,22 @@ def test_classify_tasks_sets_cell_once(admin, role_env):
     run_id = task(admin, "Пробежка 5 км")
     rep_id = task(admin, "Отчёт по SDK", source="capture")
     plan_id = task(admin, "Из плана", source="plan")
+    com_id = task(admin, "Обещал Яну методику", source="commitment")
     calls = []
 
     def fake(task_name, system, user):
         calls.append((task_name, user))
-        return json.dumps({str(run_id): {"cell_id": "A1", "size": "M"}, str(rep_id): {"cell_id": None, "size": "L"}})
+        return json.dumps({str(run_id): {"cell_id": "A1", "size": "M"}, str(rep_id): {"cell_id": None, "size": "L"},
+                           str(plan_id): {"cell_id": "A1", "size": "S"}})
     llm.set_fake(fake)
     role_env("workos_reader")
     r = dayplan.classify_tasks()
-    assert r == {"classified": 1, "seen": 2}
-    assert calls[0][0] == "classify_cell" and "A1 Бег" in calls[0][1] and "Из плана" not in calls[0][1]
+    assert r == {"classified": 2, "seen": 4}
+    # задачи из плана и обещаний тоже получают клетку (иначе за них нет опыта)
+    assert calls[0][0] == "classify_cell" and "A1 Бег" in calls[0][1]
+    assert "Из плана" in calls[0][1] and "Обещал Яну" in calls[0][1]
     rows = {t["id"]: t for t in admin.execute("SELECT id, cell_id, size FROM work.tasks")}
     assert (rows[run_id]["cell_id"], rows[run_id]["size"]) == ("A1", "M")
     assert (rows[rep_id]["cell_id"], rows[rep_id]["size"]) == (None, "L")
-    assert rows[plan_id]["cell_id"] is None
+    assert rows[plan_id]["cell_id"] == "A1" and rows[com_id]["cell_id"] is None
     assert dayplan.classify_tasks() == {"classified": 0} and len(calls) == 1

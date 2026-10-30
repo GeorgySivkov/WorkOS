@@ -10,7 +10,8 @@
 {
   "mode": "sqlite",                      // или "notifications" (фолбэк)
   "db_path": "~/Library/Containers/<bundle-id>/Data/.../store.sqlite",
-  "query": "SELECT id, ts, chat, author, text FROM ... WHERE ts > :since ORDER BY ts",
+  "query": "SELECT Z_PK AS seq, ZSERVERID AS server_id, Z_PK AS id, ZDATE AS ts, ZCHAT AS chat,
+            ZAUTHOR AS author, ZTEXT AS text FROM ZMESSAGE WHERE Z_PK > :seq ORDER BY Z_PK",
   "ts_format": "auto",                   // auto | unix | unix_ms | coredata | coredata_ns | iso
   "bundle_id": "ru.example.achat",       // для режима notifications
   "ingest_url": "http://100.x.y.z:8788",
@@ -18,12 +19,33 @@
   "source_id": "achat:alfa",
   "batch_size": 200, "overlap_minutes": 60, "initial_days": 2
 }
-Запрос должен вернуть колонки id, ts, chat, author, text (именно с такими
-именами, через AS). Параметр :since необязателен: если он есть, в него
-подставится метка в единицах ts_format, иначе фильтр по времени сделает скрипт.
 
-Метка: ~/.workos/achat.state. Сдвигается только после успешной отправки,
-каждый прогон перекрывает overlap_minutes назад (на дроплете запись идемпотентна).
+Колонки запроса (имена именно такие, через AS):
+  ts, chat, author, text   обязательны: время сообщения, чат, автор, текст;
+  id                       локальный id строки (обязателен, если нет server_id);
+  seq                      необязательно, но очень желательно: монотонный счётчик
+                           вставки (rowid, Z_PK). С ним метка идёт по нему, а не по
+                           времени: чат, который приложение докачало задним числом
+                           (старые сообщения с новыми Z_PK), не теряется;
+  server_id                необязательно: id сообщения на сервере А-Чата. С ним
+                           external_id = srv:<server_id> и после переустановки
+                           приложения (локальные id другие) дублей нет. Если id
+                           уникален только внутри чата, склей в SQL:
+                           ZCHATID || ':' || ZSERVERID AS server_id.
+Параметры: :seq (последний отправленный seq, в первый прогон -1) и :since (метка
+по времени в единицах ts_format). Оба необязательны, фильтр сделает и скрипт.
+С колонкой seq фильтруй в WHERE по :seq, а не по :since, иначе SQL сам отрежет
+докачанные старые сообщения. Первый прогон в любом случае берёт только последние
+initial_days дней. Смена id на server_id один раз задвоит сообщения за overlap.
+
+Метка: ~/.workos/achat.state ({"seq", "watermark", "at"}). Сдвигается только после
+успешной отправки. Без seq каждый прогон перекрывает overlap_minutes назад (на
+дроплете запись идемпотентна). Если нового нет, на дроплет всё равно уходит пустая
+пачка: так дроплет видит, что Мак жив, и не шлёт «А-Чат молчит» в тихие выходные.
+
+Нужен Full Disk Access для программы, которая запускает скрипт (python3, Terminal
+или launchd): без него чтение ~/Library/Containers и базы уведомлений падает, и в
+лог пишется, где это включить.
 
     python3 achat_collector.py              # один прогон
     python3 achat_collector.py --dry-run    # показать, что ушло бы, ничего не отправлять
@@ -53,6 +75,20 @@ STATE = HOME / ".workos" / "achat.state"
 NOTIF_DB = HOME / "Library" / "Group Containers" / "group.com.apple.usernoted" / "db2" / "db"
 COREDATA_EPOCH = 978307200          # 2001-01-01 в unix-секундах
 MAX_BATCH_BYTES = 1_500_000         # приёмник режет на 2 МБ
+FDA_HINT = ("Дай Full Disk Access программе, которая запускает скрипт (python3, Terminal или "
+            "launchd-агент): Системные настройки, Конфиденциальность и безопасность, Полный доступ к диску")
+ACCESS_MARKERS = ("unable to open database", "authorization denied", "not authorized",
+                  "operation not permitted", "permission denied")
+
+
+class AccessDenied(PermissionError):
+    """macOS (TCC) не пускает к файлу: нужен Full Disk Access."""
+
+
+def _is_access_error(e: BaseException) -> bool:
+    if isinstance(e, PermissionError):
+        return True
+    return isinstance(e, (sqlite3.Error, OSError)) and any(m in str(e).lower() for m in ACCESS_MARKERS)
 
 
 def log(msg: str) -> None:
@@ -114,18 +150,28 @@ def _is_number(s: str) -> bool:
 # ---------- снапшот ----------
 def snapshot(db_path: Path) -> Path:
     """Копия базы через backup API: читаем копию, а не живой файл с WAL посреди записи."""
-    if not db_path.exists():
-        raise FileNotFoundError(f"нет базы {db_path}")
+    try:
+        exists = db_path.exists()
+    except PermissionError as e:
+        raise AccessDenied(f"нет доступа к {db_path} ({e})") from e
+    if not exists:
+        raise FileNotFoundError(f"нет базы {db_path} (или macOS прячет её без Full Disk Access)")
     tmpdir = Path(tempfile.mkdtemp(prefix="workos-achat-"))
     os.chmod(tmpdir, 0o700)
     dst_path = tmpdir / "snapshot.db"
-    src = sqlite3.connect(f"file:{quote(str(db_path))}?mode=ro", uri=True, timeout=10)
-    dst = sqlite3.connect(str(dst_path))
     try:
-        src.backup(dst)
-    finally:
-        dst.close()
-        src.close()
+        src = sqlite3.connect(f"file:{quote(str(db_path))}?mode=ro", uri=True, timeout=10)
+        dst = sqlite3.connect(str(dst_path))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+    except (sqlite3.Error, OSError) as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        if _is_access_error(e):
+            raise AccessDenied(f"нет доступа к {db_path} ({e})") from e
+        raise
     return dst_path
 
 
@@ -134,7 +180,22 @@ def _drop(snap: Path) -> None:
 
 
 # ---------- чтение ----------
-def sqlite_rows(cfg: dict, since: datetime) -> list[dict]:
+def _seq(v) -> int | None:
+    try:
+        return int(v) if v is not None and str(v).strip() != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
+def sqlite_rows(cfg: dict, since: datetime, last_seq: int | None = None) -> dict:
+    """Строки запроса к снапшоту. Возвращает {rows, max_seq, top_key, anchor_key}:
+    rows: новые сообщения; max_seq: наибольший seq среди ВСЕХ строк запроса (None,
+    если колонки seq нет); top_key: отпечаток строки с max_seq (якорь на следующий
+    прогон); anchor_key: отпечаток строки с seq == last_seq в этом снапшоте.
+
+    Есть seq и метка по нему: берём seq > last_seq, время не важно (докачанный
+    задним числом чат приходит со старым ts, но новым seq). Иначе фильтр по ts > since.
+    В :seq уходит last_seq - 1, чтобы строка-якорь тоже вернулась."""
     fmt = cfg.get("ts_format") or "auto"
     query = cfg["query"]
     if ":since" in query and fmt == "auto":
@@ -143,24 +204,46 @@ def sqlite_rows(cfg: dict, since: datetime) -> list[dict]:
     try:
         con = sqlite3.connect(str(snap))
         con.row_factory = sqlite3.Row
-        params = {"since": from_dt(since, fmt)} if ":since" in query else {}
+        params: dict = {}
+        if ":since" in query:
+            params["since"] = from_dt(since, fmt)
+        if ":seq" in query:
+            params["seq"] = last_seq - 1 if last_seq is not None else -1
         rows = con.execute(query, params).fetchall()
         con.close()
     finally:
         _drop(snap)
-    out = []
+    res: dict = {"rows": [], "max_seq": None, "top_key": None, "anchor_key": None}
     for r in rows:
         keys = r.keys()
-        get = (lambda k, i: r[k] if k in keys else (r[i] if len(keys) > i else None))
+        named = "seq" in keys or "server_id" in keys       # новые колонки: только по именам
+        get = (lambda k, i: r[k] if k in keys else (r[i] if not named and len(keys) > i else None))
+        seq = _seq(r["seq"]) if "seq" in keys else None
         ts = to_dt(get("ts", 1), fmt)
-        if ts is None or ts <= since:
+        server_id = _s(r["server_id"]) if "server_id" in keys else None
+        local_id = get("id", 0)
+        if server_id is None and local_id is None:
+            raise ValueError("запрос должен вернуть колонку id или server_id")
+        ext_id = f"srv:{server_id}" if server_id else str(local_id)
+        if seq is not None:
+            fp = f"{ext_id}|{ts.isoformat() if ts else ''}"
+            if res["max_seq"] is None or seq > res["max_seq"]:
+                res["max_seq"], res["top_key"] = seq, fp
+            if seq == last_seq:
+                res["anchor_key"] = fp
+        if ts is None:
+            continue
+        if seq is not None and last_seq is not None:
+            if seq <= last_seq:
+                continue                                  # уже отправлено
+        elif ts <= since:
             continue
         text = get("text", 4)
         if text is None or str(text).strip() == "":
             continue
-        out.append({"id": str(get("id", 0)), "ts": ts, "chat": _s(get("chat", 2)),
-                    "author": _s(get("author", 3)), "text": str(text)})
-    return out
+        res["rows"].append({"id": ext_id, "seq": seq, "ts": ts, "chat": _s(get("chat", 2)),
+                            "author": _s(get("author", 3)), "text": str(text)})
+    return res
 
 
 NOTIF_SQL = """
@@ -228,10 +311,11 @@ def to_event(row: dict, mode: str) -> dict:
     }
 
 
-def batches(events: list[dict], size: int):
+def batches(events: list, size: int, key=lambda e: e):
+    """Пачки не больше size штук и MAX_BATCH_BYTES байт. key достаёт событие из элемента."""
     cur, cur_bytes = [], 0
     for e in events:
-        n = len(json.dumps(e, ensure_ascii=False).encode())
+        n = len(json.dumps(key(e), ensure_ascii=False).encode())
         if cur and (len(cur) >= size or cur_bytes + n > MAX_BATCH_BYTES):
             yield cur
             cur, cur_bytes = [], 0
@@ -241,7 +325,7 @@ def batches(events: list[dict], size: int):
         yield cur
 
 
-def post(cfg: dict, events: list[dict], watermark: str) -> dict:
+def post(cfg: dict, events: list[dict], watermark: str | None) -> dict:
     base = cfg["ingest_url"].rstrip("/")
     url = base if "/ingest/" in base else f"{base}/ingest/{quote(cfg['source_id'], safe=':')}"
     data = json.dumps({"events": events, "watermark": watermark}, ensure_ascii=False).encode()
@@ -282,22 +366,63 @@ def run(cfg: dict, dry_run: bool = False) -> dict:
     state = load_state()
     now = datetime.now(UTC)
     wm = to_dt(state.get("watermark"), "iso") if state.get("watermark") else None
+    last_seq = _seq(state.get("seq"))
     since = (wm - timedelta(minutes=int(cfg.get("overlap_minutes", 60)))) if wm \
         else now - timedelta(days=int(cfg.get("initial_days", 2)))
-    rows = notification_rows(cfg, since) if mode == "notifications" else sqlite_rows(cfg, since)
-    rows.sort(key=lambda r: r["ts"])
-    events = [to_event(r, mode) for r in rows]
+    anchor = state.get("anchor")
+    top_key = None
+    if mode == "notifications":
+        rows, max_seq = notification_rows(cfg, since), None
+    else:
+        res = sqlite_rows(cfg, since, last_seq)
+        if last_seq is not None and anchor and res["anchor_key"] != anchor:
+            # строка-якорь пропала или стала другой: хранилище пересоздано (переустановка,
+            # новый вход), Z_PK начались заново. Метку по seq сбрасываем, берём по времени
+            log("хранилище А-Чата пересоздано: метка по seq сброшена, беру по времени с перекрытием")
+            last_seq = None
+            res = sqlite_rows(cfg, since, None)
+        rows, max_seq, top_key = res["rows"], res["max_seq"], res["top_key"]
+    by_seq = max_seq is not None
+    rows.sort(key=(lambda r: (r["seq"] if r.get("seq") is not None else -1, r["ts"])) if by_seq
+              else (lambda r: r["ts"]))
+    pairs = [(r, to_event(r, mode)) for r in rows]
     if dry_run:
-        for e in events[:50]:
+        for _, e in pairs[:50]:
             print(json.dumps(e, ensure_ascii=False))
         return {"rows": len(rows), "dry_run": True}
     sent = 0
-    for chunk in batches(events, int(cfg.get("batch_size", 200))):
-        chunk_wm = chunk[-1]["occurred_at"]
-        post(cfg, chunk, chunk_wm)
+    time_wm = wm
+    seq_wm = last_seq
+    chunk_anchor = anchor if last_seq is not None else None
+    for chunk in batches(pairs, int(cfg.get("batch_size", 200)), key=lambda p: p[1]):
+        chunk_ts = max(r["ts"] for r, _ in chunk)
+        time_wm = chunk_ts if time_wm is None else max(time_wm, chunk_ts)
+        with_seq = [r for r, _ in chunk if r.get("seq") is not None]
+        if with_seq:
+            top = max(with_seq, key=lambda r: r["seq"])
+            if seq_wm is None or top["seq"] > seq_wm:
+                seq_wm, chunk_anchor = top["seq"], f"{top['id']}|{top['ts'].isoformat()}"
+        post(cfg, [e for _, e in chunk], time_wm.isoformat())
         sent += len(chunk)
-        save_state({"watermark": chunk_wm, "at": now.isoformat()})
+        save_state(_state(time_wm, seq_wm, now, chunk_anchor))
+    if max_seq is not None:
+        seq_wm = max_seq                     # все строки запроса пройдены, включая пропущенные
+    if not sent:
+        # нового нет: пустая пачка = «Мак жив», дроплет обновит last_ok_at
+        post(cfg, [], time_wm.isoformat() if time_wm else None)
+    save_state(_state(time_wm, seq_wm, now, top_key if max_seq is not None else None))
     return {"rows": len(rows), "sent": sent}
+
+
+def _state(time_wm: datetime | None, seq_wm: int | None, now: datetime, anchor: str | None = None) -> dict:
+    st: dict = {"at": now.isoformat()}
+    if time_wm is not None:
+        st["watermark"] = time_wm.isoformat()
+    if seq_wm is not None:
+        st["seq"] = seq_wm
+    if anchor:
+        st["anchor"] = anchor
+    return st
 
 
 def main(argv=None) -> int:
@@ -319,10 +444,13 @@ def main(argv=None) -> int:
         log(f"ошибка приёмника: HTTP {e.code} {e.read()[:200]!r}")
     except urllib.error.URLError as e:
         log(f"дроплет недоступен ({e.reason}): метка не сдвинута, повторю в следующий раз")
-    except sqlite3.DatabaseError as e:
-        log(f"ошибка базы: {e}. Если путь в ~/Library/Containers, дай python3 Full Disk Access")
     except Exception as e:  # noqa: BLE001
-        log(f"ошибка: {type(e).__name__}: {e}")
+        if _is_access_error(e):
+            log(f"нет доступа к базе: {e}. {FDA_HINT}. Метка не сдвинута")
+        elif isinstance(e, sqlite3.DatabaseError):
+            log(f"ошибка базы: {e}. Если путь в ~/Library, проверь Full Disk Access: {FDA_HINT}")
+        else:
+            log(f"ошибка: {type(e).__name__}: {e}")
     return 1
 
 

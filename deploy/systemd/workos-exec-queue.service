@@ -19,6 +19,8 @@ ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/workos-exec /tmp
 PrivateTmp=true
+ProtectProc=invisible
+ProcSubset=pid
 
 [Install]
 WantedBy=multi-user.target

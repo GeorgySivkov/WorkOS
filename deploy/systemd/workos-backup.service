@@ -6,3 +6,6 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/workos
 ExecStart=/bin/bash /opt/workos/deploy/backup.sh
+TimeoutStartSec=1h
+PrivateTmp=true
+ProtectProc=invisible

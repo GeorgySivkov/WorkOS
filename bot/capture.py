@@ -70,6 +70,17 @@ def msg_text(msg: dict) -> str:
     return (msg.get("text") or msg.get("caption") or "").strip()
 
 
+def sent_at(msg: dict) -> datetime:
+    """Когда George отправил сообщение (у правки Telegram оставляет дату оригинала).
+    Сообщение не бывает из будущего: при расхождении часов берётся более раннее."""
+    now = tu.now()
+    try:
+        ts = datetime.fromtimestamp(int(msg["date"]), timezone.utc)
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return now
+    return min(ts, now)
+
+
 def has_link(msg: dict) -> bool:
     for ent in (msg.get("entities") or []) + (msg.get("caption_entities") or []):
         if ent.get("type") in ("url", "text_link"):
@@ -181,20 +192,42 @@ def classify(conn, text: str, now: datetime | None = None, fwd: str | None = Non
     if p.due or p.week_of:                # явная дата или время из текста (время ruparse дополняет датой)
         due, week_of, at = p.due, p.week_of, p.at or (at if p.due else None)
     if at and not due and not week_of:
-        due = today if tu.at_local(today, at) > now else today + timedelta(days=1)
+        # время без даты: ближайшее будущее, день = логический день этого момента
+        cand = tu.local_dt_for(today, at)
+        if cand <= now:
+            cand = tu.local_dt_for(today + timedelta(days=1), at)
+        due = tu.logical_date(cand)
     return {"kind": kind, "context": cid, "confidence": round(conf, 2), "title": title,
             "due": due.isoformat() if due else None, "week_of": week_of.isoformat() if week_of else None,
             "time": at.strftime("%H:%M") if at else None, "size": size, "cell_id": cell, "model": model}
 
 
-def create_task(conn, cls: dict) -> int:
+def remind_of(cls: dict) -> datetime | None:
+    """Момент напоминания из дня и времени разметки (0:00-3:59 = ночь после дня)."""
     due, at = _date(cls.get("due")), _time(cls.get("time"))
-    remind = tu.at_local(due, at) if (due and at) else None
+    return tu.local_dt_for(due, at) if (due and at) else None
+
+
+def block_of(cls: dict, remind: datetime | None) -> tuple[datetime | None, datetime | None]:
+    """Время, которое George назвал сам, это ручной блок: расстановщик и живой день
+    считают его занятым и не двигают (как у задачи из мини-приложения)."""
+    if remind is None:
+        return None, None
+    size = cls.get("size") if cls.get("size") in config.SIZE_MINUTES else "S"
+    return remind, remind + timedelta(minutes=config.SIZE_MINUTES[size])
+
+
+def create_task(conn, cls: dict) -> int:
+    remind = remind_of(cls)
+    ps, pe = block_of(cls, remind)
     return conn.execute(
-        """INSERT INTO work.tasks (context_id, title, due, week_of, remind_at, size, cell_id, source)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, 'capture') RETURNING id""",
-        (cls.get("context"), cls["title"], due, _date(cls.get("week_of")), remind,
-         cls.get("size") or "S", cls.get("cell_id"))).fetchone()["id"]
+        """INSERT INTO work.tasks (context_id, title, due, week_of, remind_at, size, cell_id, source,
+                                   planned_start, planned_end, planned_by, planned_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, 'capture', %s, %s, %s, CASE WHEN %s THEN now() END)
+           RETURNING id""",
+        (cls.get("context"), cls["title"], _date(cls.get("due")), _date(cls.get("week_of")), remind,
+         cls.get("size") or "S", cls.get("cell_id"), ps, pe, "manual" if ps else None,
+         ps is not None)).fetchone()["id"]
 
 
 # ---------- ответ ----------
@@ -254,8 +287,8 @@ def handle(ctx: Ctx, msg: dict, text: str | None = None, voice: bool = False,
         what = "Фото" if msg.get("photo") else "Сообщение"
         ctx.reply(msg, f"{what} сохранил в базу.")
         return eid
-    now = tu.now()
-    cls = classify(conn, body, now, forward_name(msg))
+    # «завтра» считается от момента, когда George написал, а не когда бот дочитал очередь
+    cls = classify(conn, body, sent_at(msg), forward_name(msg))
     with conn.transaction():
         patch = {"class": cls}
         if cls["kind"] == "task":
@@ -277,7 +310,8 @@ def _load(conn, eid: int) -> dict | None:
 def _task_state(conn, task_id) -> dict | None:
     if not task_id:
         return None
-    return conn.execute("SELECT id, done_at, dropped_at FROM work.tasks WHERE id = %s", (task_id,)).fetchone()
+    return conn.execute("""SELECT id, done_at, dropped_at, size, remind_at, planned_by, planned_start, planned_end
+                           FROM work.tasks WHERE id = %s""", (task_id,)).fetchone()
 
 
 def on_callback(ctx: Ctx, cq: dict, parts: list[str]) -> str | None:
@@ -366,17 +400,30 @@ def on_edit(ctx: Ctx, msg: dict) -> None:
     task = _task_state(conn, meta.get("task_id"))
     with conn.transaction():
         if cls and cls.get("kind") == "task" and task and task["done_at"] is None and task["dropped_at"] is None:
-            p = ruparse.parse(text, tu.now())
+            # даты считаются от исходного сообщения: правка опечатки назавтра не сдвигает «завтра»
+            p = ruparse.parse(text, sent_at(msg))
             cls = dict(cls, title=p.title or cls["title"])
             if p.due or p.week_of:
                 cls.update(due=p.due.isoformat() if p.due else None,
                            week_of=p.week_of.isoformat() if p.week_of else None,
                            time=p.at.strftime("%H:%M") if p.at else None)
-            due, at = _date(cls.get("due")), _time(cls.get("time"))
-            conn.execute("""UPDATE work.tasks SET title = %s, due = %s, week_of = %s, remind_at = %s,
-                                   reminded_at = NULL WHERE id = %s""",
-                         (cls["title"], due, _date(cls.get("week_of")),
-                          tu.at_local(due, at) if due and at else None, task["id"]))
+            remind = remind_of(cls)
+            conn.execute("UPDATE work.tasks SET title = %s, due = %s, week_of = %s WHERE id = %s",
+                         (cls["title"], _date(cls.get("due")), _date(cls.get("week_of")), task["id"]))
+            if remind != task["remind_at"]:
+                # время поменялось: напоминание взводится заново, ручной блок едет следом
+                conn.execute("UPDATE work.tasks SET remind_at = %s, reminded_at = NULL WHERE id = %s",
+                             (remind, task["id"]))
+                ps, pe = block_of(dict(cls, size=task["size"]), remind)
+                if ps is not None:
+                    conn.execute("""UPDATE work.tasks SET planned_start = %s, planned_end = %s,
+                                           planned_by = 'manual', planned_at = now() WHERE id = %s""",
+                                 (ps, pe, task["id"]))
+                elif task["planned_by"] == "manual" and task["remind_at"] is not None \
+                        and task["planned_start"] == task["remind_at"]:
+                    # время из текста убрали: снимается и блок, который из него вырос
+                    conn.execute("""UPDATE work.tasks SET planned_start = NULL, planned_end = NULL,
+                                           planned_by = NULL, planned_at = now() WHERE id = %s""", (task["id"],))
             patch["class"] = cls
         merge_meta(conn, row["id"], patch)
     if cls and meta.get("reply_id"):

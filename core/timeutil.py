@@ -44,6 +44,13 @@ def at_local(d: date, t: time) -> datetime:
     return datetime.combine(d, t, tzinfo=config.TZ).astimezone(UTC)
 
 
+def local_dt_for(d: date, t: time) -> datetime:
+    """Время t внутри логического дня d -> UTC. 00:00-03:59 логического дня d
+    это уже следующие календарные сутки: «пт в 0:30» = ночь с пятницы на субботу."""
+    cal = d + timedelta(days=1) if t.hour < config.LOGICAL_DAY_END_HOUR else d
+    return at_local(cal, t)
+
+
 def day_bounds(d: date) -> tuple[datetime, datetime]:
     """Границы логического дня d в UTC: [d 04:00, d+1 04:00)."""
     h = config.LOGICAL_DAY_END_HOUR

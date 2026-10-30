@@ -11,7 +11,9 @@ workos_reader). Слушает INGEST_BIND (по умолчанию 127.0.0.1:87
 
 Принимается только для включённых источников вида 'achat'. Запись
 идемпотентна (collectors.base.upsert_events), last_ok_at и watermark
-обновляются. Тело запроса не больше 2 МБ.
+обновляются. Тело запроса не больше 2 МБ. kind всегда 'message' (другое: 400),
+в meta только известные ключи А-Чата со строками и числами (META_KEYS), остальное: 400,
+чтобы снаружи нельзя было подложить служебные метки (plan_paste, domain, action_id и т.п.).
 
 Запуск: python workctl.py ingest  или  python -m collectors.ingest_server
 """
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import re
 import sys
 from datetime import datetime, timezone
@@ -32,7 +35,10 @@ MAX_BODY = 2 * 1024 * 1024
 MAX_EVENTS = 5000
 PATH_RX = re.compile(r"^/ingest/([A-Za-z0-9:_\-.]{1,100})/?$")
 ALLOWED_KINDS = {"achat"}
-EVENT_KINDS = {"message", "note", "email", "meeting", "card", "calendar"}
+EVENT_KIND = "message"
+# что шлёт mac/achat_collector.py: чат, автор, режим чтения и идентификаторы приложения
+META_KEYS = {"chat", "author", "mode", "chat_id", "author_id", "message_id", "app", "bundle_id"}
+META_STR_LIMIT = 300
 
 
 class BadRequest(ValueError):
@@ -49,6 +55,26 @@ def _str(v, field: str, limit: int, required: bool = False) -> str | None:
     return str(v)[:limit]
 
 
+def _meta(raw) -> dict:
+    """meta только из белого списка ключей, значения строки или числа (или null)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise BadRequest("meta должна быть объектом")
+    out = {}
+    for k, v in raw.items():
+        if k not in META_KEYS:
+            raise BadRequest(f"meta: ключ {str(k)[:40]} не принимается")
+        if v is None:
+            out[k] = None
+        elif (isinstance(v, bool) or not isinstance(v, (str, int, float))
+              or (isinstance(v, float) and not math.isfinite(v))):
+            raise BadRequest(f"meta.{k} должно быть строкой или числом")
+        else:
+            out[k] = v[:META_STR_LIMIT] if isinstance(v, str) else v
+    return out
+
+
 def parse_event(raw: dict) -> Event:
     if not isinstance(raw, dict):
         raise BadRequest("событие должно быть объектом")
@@ -59,12 +85,10 @@ def parse_event(raw: dict) -> Event:
         raise BadRequest(f"occurred_at не ISO: {occurred}") from e
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
-    kind = _str(raw.get("kind"), "kind", 32) or "message"
-    if kind not in EVENT_KINDS:
-        raise BadRequest(f"неизвестный kind {kind}")
-    meta = raw.get("meta") or {}
-    if not isinstance(meta, dict):
-        raise BadRequest("meta должна быть объектом")
+    kind = _str(raw.get("kind"), "kind", 32) or EVENT_KIND
+    if kind != EVENT_KIND:
+        raise BadRequest(f"kind {kind} не принимается, только {EVENT_KIND}")
+    meta = _meta(raw.get("meta"))
     return Event(external_id=_str(raw.get("external_id"), "external_id", 300, required=True),
                  kind=kind, occurred_at=dt,
                  title=_str(raw.get("title"), "title", 1000),

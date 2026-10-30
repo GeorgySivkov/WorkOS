@@ -6,8 +6,11 @@
 Модель (задача 'planner') решает, ЧТО делать; КОГДА, считает agents.scheduler.place.
 Выход: текст в тему «План» и карточка plan_batch (status proposed, кнопки рисует бот).
 
-План всегда на логическое «завтра»: в 23:50 и в 00:30 это один и тот же день,
-который начнётся утром (логический день кончается в 4:00).
+День плана без --date (target_date): ночью и вечером это логическое «завтра»
+(в 23:50 и в 00:30 это один и тот же день, который начнётся утром: логический день
+кончается в 4:00). Догоняющий запуск с 4:00 до 18:00 (таймер Persistent после
+перезагрузки, ручной запуск утром) планирует уже начавшийся день и ставит задачи
+с текущей минуты: иначе у сегодня нет плана, а ночной запуск пропустит завтра.
 """
 from __future__ import annotations
 
@@ -19,6 +22,7 @@ from core import config, db, llm, timeutil as tu
 from core.tg import esc
 
 SIZES = ("S", "M", "L")
+PLAN_TODAY_UNTIL = 18          # до этого часа догоняющий запуск планирует сегодня, позже завтра
 
 
 # ---------- общее: предложить действие ----------
@@ -43,8 +47,31 @@ def scheduler():
 
 # ---------- время ----------
 def target_date(now: datetime | None = None) -> date:
-    """Логическое завтра: в 00:00-04:00 это календарное сегодня."""
-    return tu.logical_date(now or tu.now()) + timedelta(days=1)
+    """День плана: в 00:00-04:00 и вечером логическое завтра, днём (догоняющий запуск) сегодня."""
+    now = now or tu.now()
+    today = tu.logical_date(now)
+    if config.LOGICAL_DAY_END_HOUR <= tu.local(now).hour < PLAN_TODAY_UNTIL:
+        return today
+    return today + timedelta(days=1)
+
+
+def fixed_blocks(conn, sched, day: date) -> list[dict]:
+    """Время дня, которое George назначил сам (scheduler.fixed_slot): ручные блоки и «в 10»
+    из текста задачи. Не двигается и занимает время. id отрицательные: это не пункты плана."""
+    d0, d1 = tu.day_bounds(day)
+    rows = conn.execute(
+        """SELECT id, title, size, due, remind_at, planned_by, planned_start, planned_end FROM work.tasks
+           WHERE done_at IS NULL AND dropped_at IS NULL
+             AND ((planned_start < %(d1)s AND planned_end > %(d0)s)
+                  OR (planned_start IS NULL AND remind_at >= %(d0)s AND remind_at < %(d1)s))
+           ORDER BY id""", {"d0": d0, "d1": d1}).fetchall()
+    out = []
+    for t in rows:
+        fx = sched.fixed_slot(t, day)
+        if fx:
+            out.append({"id": -t["id"], "size": t["size"], "title": t["title"], "planned_by": "manual",
+                        "planned_start": fx[0], "planned_end": fx[1]})
+    return out
 
 
 def merge(intervals):
@@ -57,9 +84,12 @@ def merge(intervals):
     return out
 
 
-def free_minutes(day: date, meetings, other=()) -> int:
-    """Свободное время окна дня: без встреч (с буфером, как у расстановщика) и без other."""
+def free_minutes(day: date, meetings, other=(), start: datetime | None = None) -> int:
+    """Свободное время окна дня (с минуты start, если день уже идёт): без встреч
+    (с буфером, как у расстановщика) и без other."""
     w0, w1 = tu.waking_window(day)
+    if start is not None:
+        w0 = min(max(w0, start), w1)
     buf = timedelta(minutes=config.BUFFER_MINUTES)
     busy = [(s - buf, e + buf) for s, e in meetings] + list(other)
     taken = sum(((min(e, w1) - max(s, w0)).total_seconds() for s, e in merge(busy) if e > w0 and s < w1), 0.0)
@@ -289,18 +319,19 @@ def run(date: str | None = None, dry_run: bool = False, force: bool = False, now
             return {"skipped": f"план на {day} уже был", "for_date": day.isoformat()}
         ctx = build_context(conn, day, now)
         busy = list(sched.busy_from_feed(conn, day))
-        # то, что George уже поставил на завтра руками, не двигается и занимает время
-        fixed = [{"id": -t["id"], "size": t["size"], "title": t["title"], "planned_by": "manual",
-                  "planned_start": t["planned_start"], "planned_end": t["planned_end"]}
-                 for t in ctx["tomorrow_tasks"]
-                 if t["planned_by"] == "manual" and t["planned_start"] and t["planned_end"]]
-        fixed_min = sum(int((f["planned_end"] - f["planned_start"]).total_seconds() // 60) for f in fixed)
+        # догоняющий запуск днём: день уже идёт, ставить можно только с текущей минуты
+        since = now if day == tu.logical_date(now) else None
+        # то, что George уже поставил на этот день сам, не двигается и занимает время
+        fixed = fixed_blocks(conn, sched, day)
+        fixed_by_task = {-f["id"]: f for f in fixed}
+        fixed_min = sum(max(0, int((f["planned_end"] - max(f["planned_start"], since or f["planned_start"]))
+                                   .total_seconds() // 60)) for f in fixed)
         tr = tu.at_local(day, tu.parse_hm(config.TRAINING_DEFAULT))
         if tr < tu.waking_window(day)[0]:
             tr += timedelta(days=1)                   # тренировка после полуночи
         guess = [(tr, tr + timedelta(minutes=config.TRAINING_MINUTES))] \
             if day.weekday() in config.TRAINING_WEEKDAYS else []
-        free = free_minutes(day, busy, guess)
+        free = free_minutes(day, busy, guess, start=since)
         cap = max(0, int(free * config.FILL_RATIO) - fixed_min)
         system = SYSTEM + (SUNDAY if ctx["sunday"] else "")
         user = render_context(ctx, cap, free)
@@ -323,16 +354,24 @@ def run(date: str | None = None, dry_run: bool = False, force: bool = False, now
             waiting = [f"{c['who'] or '?'}: {c['what']}" + (f" (до {tu.ru_date(c['due'], weekday=False)})"
                                                             if c["due"] else "")
                        for c in ctx["commitments"] if c["direction"] == "theirs"]
+        # пункт плана про задачу с ручным временем стоит в своё время, а не расставляется заново
+        pinned = set()
+        for n, i in enumerate(items):
+            f = fixed_by_task.get(i.get("task_id"))
+            if f:
+                i["start"], i["end"] = _iso(f["planned_start"]), _iso(f["planned_end"])
+                pinned.add(n)
         pseudo = [{"id": n + 1, "size": i["size"], "title": i["title"], "planned_by": None}
-                  for n, i in enumerate(items)]
-        placed = sched.place(day, pseudo + fixed, busy) if pseudo else {}
+                  for n, i in enumerate(items) if n not in pinned]
+        placed = sched.place(day, pseudo + fixed, busy, now=since) if pseudo else {}
         training = placed.get("training")
         for n, i in enumerate(items):
             slot = placed.get(n + 1)
             if slot:
                 i["start"], i["end"] = _iso(slot[0]), _iso(slot[1])
-        free_real = free_minutes(day, busy, [training] if training else guess)
-        used = fixed_min + sum(config.SIZE_MINUTES[i["size"]] for i in items if i.get("start"))
+        free_real = free_minutes(day, busy, [training] if training else guess, start=since)
+        used = fixed_min + sum(config.SIZE_MINUTES[i["size"]] for n, i in enumerate(items)
+                               if i.get("start") and n not in pinned)
         pct = round(100 * used / free_real) if free_real > 0 else None
         text = render_text(day, str(ans.get("summary") or "").replace("—", ":").strip(), items, training, pct,
                            week_items, waiting)

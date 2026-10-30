@@ -13,6 +13,7 @@ import logging
 import os
 
 from core import config
+from core.tg import scrub
 
 from bot import capture
 from bot.topics import Ctx
@@ -54,7 +55,7 @@ def handle_message(ctx: Ctx, msg: dict, key: str) -> int | None:
         if path:
             capture.merge_meta(conn, eid, {"file_path": path})
     except Exception as e:
-        log.warning("домен %s: файл не скачался: %s", key, e)
+        log.warning("домен %s: файл не скачался: %s", key, scrub(f"{type(e).__name__}: {e}"))
     conn.execute("SELECT pg_notify(%s, %s)", (f"domain_{key}", str(eid)))
     return eid
 

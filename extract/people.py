@@ -596,6 +596,23 @@ def _context_index(conn, context_id: str) -> NameIndex:
     return _index_for(conn, {r["person_id"] for r in rows}, context_id)
 
 
+context_index = _context_index      # публичное имя: бот проверяет голые имена перед записью обличья
+
+
+def bare_key(raw: str) -> tuple[str, ...] | None:
+    """Ключ голого имени («Саша», «Сашей») или None, если в строке больше одного слова-имени."""
+    toks = [t for _, _, t in tokens(raw) if len(t) >= 2 and not _PATRONYMIC.search(t)]
+    return (name_key(toks[0]),) if len(toks) == 1 and name_key(toks[0]) else None
+
+
+def shared_bare_name(conn, raw: str, context_id: str | None, person_id: int | None = None) -> bool:
+    """Голое имя, которое в контексте носит кто-то, кроме person_id: как обличье его писать нельзя."""
+    key = bare_key(raw)
+    if not key or not context_id:
+        return False
+    return bool(context_index(conn, context_id).forms.get(key, set()) - {person_id})
+
+
 def _suggestion(conn, pid: int) -> dict:
     r = conn.execute(
         """SELECT p.display_name,

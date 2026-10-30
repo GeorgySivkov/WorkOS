@@ -12,7 +12,10 @@ meta.status='cancelled' в finalize(): строки не удаляются ни
 Зеркало: WorkOS пишет копии встреч Инфатики и Альфы и блоки плана в
 отдельный календарь, а здесь читается только адрес основного личного
 календаря (и календаря Инфатики). Адрес календаря-зеркала сюда не
-подключать: копии вернутся в базу и встречи задвоятся.
+подключать: копии вернутся в базу и встречи задвоятся. Страховка на случай,
+если подключат: события с UID вида <32 символа 0-9a-v>@google.com (так Google
+экспортирует id копий зеркала и блоков плана, executors.calendar.mirror_id)
+пропускаются.
 
 Настройки источника (work.sources.config):
   {"url_env": "ICAL_PERSONAL_URL", "past_days": 7, "future_days": 60,
@@ -21,6 +24,7 @@ meta.status='cancelled' в finalize(): строки не удаляются ни
 """
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Iterable
 
@@ -32,6 +36,8 @@ from collectors.base import Collector, Event, run_enabled
 from core import config, timeutil as tu
 
 UTC = timezone.utc
+# id копий зеркала и блоков плана (sha1 в base32hex, 32 символа) в iCal-экспорте Google
+OWN_UID_RE = re.compile(r"^[0-9a-v]{32}@google\.com$")
 
 
 def default_url_env(source_id: str) -> str:
@@ -115,6 +121,8 @@ class ICalCollector(Collector):
         uid = str(comp.get("UID") or "")
         if not uid or comp.get("DTSTART") is None:
             return None
+        if OWN_UID_RE.match(uid):
+            return None                 # наша же копия или блок плана: не возвращаем в базу
         dtstart = comp.get("DTSTART").dt
         all_day = not isinstance(dtstart, datetime)
         starts = to_utc(dtstart)

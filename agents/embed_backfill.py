@@ -8,8 +8,13 @@
 
 Индекс по вектору не строится (решение 0.3): только по факту замедления.
 Работает под workos_reader: у него UPDATE на events и decisions.
-В public.usage_log: command 'work_embed', cost 0, tokens = число фрагментов;
+В public.usage_log: command 'work_embed', cost 0, tokens = число фрагментов, одна строка
+на пачку (прогон, убитый по памяти или таймауту, всё равно оставляет учёт);
 секунды видны в сводке запуска (отдельной колонки в usage_log нет).
+
+Прогон ограничен по времени (max_minutes, по умолчанию 40, `workctl embed --max-minutes N`):
+первый бэкфилл за 90 дней на дроплете может идти часами, поэтому он идёт частями по ночам,
+свежие строки первыми. В сводке partial=true, если время вышло раньше, чем работа.
 """
 from __future__ import annotations
 
@@ -21,6 +26,7 @@ from core import db, embed
 log = logging.getLogger("workos.embed")
 
 MAX_CHARS = 2000
+MAX_MINUTES = 40
 
 # таблица -> (заголовок, текст, время, доп. условие)
 TABLES = {
@@ -55,7 +61,15 @@ def _count(conn, table: str, model: str, days: int) -> int:
                         {"model": model, "days": days, "skip": []}).fetchone()["n"]
 
 
-def _backfill(conn, table: str, model: str, days: int, batch: int) -> int:
+def _log_usage(conn, n: int) -> None:
+    try:
+        conn.execute("INSERT INTO public.usage_log (command, cost_usd, tokens) VALUES ('work_embed', 0, %s)", (n,))
+    except Exception as e:  # noqa: BLE001 — учёт не роняет бэкфилл
+        log.warning("usage_log: %s", e)
+
+
+def _backfill(conn, table: str, model: str, days: int, batch: int, deadline: float | None = None) -> tuple[int, bool]:
+    """-> (сколько посчитано, кончилось ли время раньше работы)."""
     vtype = embed.vector_type(conn, f"work.{table}")
     if vtype:
         upd = f"UPDATE work.{table} SET embedding = %s::{vtype}, embedding_model = %s WHERE id = %s"
@@ -64,6 +78,8 @@ def _backfill(conn, table: str, model: str, days: int, batch: int) -> int:
     done = 0
     seen: list[int] = []
     while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            return done, True
         rows = conn.execute(_select(table), {"model": model, "days": days, "skip": seen,
                                             "n": batch, "chars": MAX_CHARS}).fetchall()
         if not rows:
@@ -74,15 +90,18 @@ def _backfill(conn, table: str, model: str, days: int, batch: int) -> int:
         with conn.transaction():
             with conn.cursor() as cur:
                 cur.executemany(upd, params)
+        _log_usage(conn, len(rows))
         seen.extend(r["id"] for r in rows)      # страховка от вечного цикла, если строка не обновилась
         done += len(rows)
         log.info("embed %s: +%d (всего %d)", table, len(rows), done)
-    return done
+    return done, False
 
 
-def run(date: str | None = None, dry_run: bool = False, days: int = 90, batch: int = 32, **kw) -> dict:
+def run(date: str | None = None, dry_run: bool = False, days: int = 90, batch: int = 32,
+        max_minutes: float | None = MAX_MINUTES, **kw) -> dict:
     model = embed.model_name()
     t0 = time.time()
+    deadline = time.monotonic() + float(max_minutes) * 60 if max_minutes else None
     out: dict = {"model": model, "days": days}
     with db.connect(autocommit=True) as conn:
         if dry_run:
@@ -90,18 +109,14 @@ def run(date: str | None = None, dry_run: bool = False, days: int = 90, batch: i
                 out[f"{table}_todo"] = _count(conn, table, model, days)
             out["dry_run"] = True
             return out
+        partial = False
         for table in ("events", "decisions"):
-            out[table] = _backfill(conn, table, model, days, batch)
-        total = out["events"] + out["decisions"]
-        secs = round(time.time() - t0, 1)
-        out["seconds"] = secs
-        if total:
-            try:
-                conn.execute("INSERT INTO public.usage_log (command, cost_usd, tokens) VALUES ('work_embed', 0, %s)",
-                             (total,))
-            except Exception as e:  # noqa: BLE001 — учёт не роняет бэкфилл
-                log.warning("usage_log: %s", e)
-    log.info("embed: %d фрагментов за %.1f с", total, secs)
+            out[table], cut = _backfill(conn, table, model, days, batch, deadline)
+            partial = partial or cut
+        out["partial"] = partial
+    total = out["events"] + out["decisions"]
+    out["seconds"] = secs = round(time.time() - t0, 1)
+    log.info("embed: %d фрагментов за %.1f с%s", total, secs, ", время вышло, остальное в следующий раз" if partial else "")
     return out
 
 

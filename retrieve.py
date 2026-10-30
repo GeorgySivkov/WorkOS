@@ -14,8 +14,9 @@ decisions, commitments, contexts). Порядок в теме «Спросить
 
 Поиск: вектор (pgvector <=>, запрос через core.embed kind='query', только строки той же
 embedding_model) плюс русский полнотекст, слияние reciprocal rank fusion. Без pgvector
-(тестовая база) и без файлов модели остаётся полнотекст. WORKOS_ASK_VECTOR=0 выключает
-вектор в боте совсем (модель держит в памяти ~400 МБ).
+(тестовая база) и без файлов модели остаётся полнотекст. Вектор в боте включается явно
+WORKOS_ASK_VECTOR=1 (модель держит в памяти ~400 МБ, на дроплете 1 ГБ это риск OOM);
+по умолчанию 0, то есть только полнотекст.
 
 Ручная проверка: python -m retrieve "что мы решили по SDK в июне"
 """
@@ -148,7 +149,7 @@ def _tsquery(conn, query: str) -> str:
 
 
 def _query_vector(conn, query: str) -> tuple[str, str] | None:
-    if config.env("WORKOS_ASK_VECTOR", "1") == "0":
+    if config.env("WORKOS_ASK_VECTOR", "0") != "1":
         return None
     vtype = embed.vector_type(conn, "work.events")
     if not vtype:

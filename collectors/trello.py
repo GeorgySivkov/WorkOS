@@ -3,7 +3,8 @@
 Карточки доски (по умолчанию George_Sivkov_Board), изменённые с прошлого
 прогона минус lookback_days. Зеркальные карточки (cardRole='mirror',
 поле mirrorSourceId) разрешаются в исходную: имя, описание, срок и метки
-берутся у неё, оба id остаются в meta.
+берутся у неё, оба id остаются в meta. body = описание при первой встрече с
+карточкой, текущие имя и описание всегда в meta.name и meta.desc.
 
 Настройки источника (work.sources.config):
   {"board_id": "6a19...", "board_ids": [...], "workspace_id": "...",
@@ -169,7 +170,10 @@ class TrelloCollector(Collector):
             })
         elif src_id:
             meta["mirror_of"] = src_id          # источник недоступен, но связь сохраняем
-        meta.update({"name": name, "labels": card_labels, "members": card_members, "due": due})
+        # body события не переписывается (правило коллекторов): текущее описание
+        # карточки держим в meta.desc, как текущее имя в meta.name
+        meta.update({"name": name, "desc": desc or "", "labels": card_labels, "members": card_members,
+                     "due": due})
         yield Event(external_id=card["id"], kind="card", occurred_at=changed, title=name,
                     body=desc or None, meta=meta, thread_key=f"trello:{src_id or card['id']}")
 

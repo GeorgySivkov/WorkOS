@@ -141,8 +141,11 @@ def test_auth_and_static(c, srv):
         r = c.get("/api/today", headers={"Authorization": hdr})
         assert r.status_code == 401 and r.json() == {"error": "unauthorized"}, hdr
     assert c.post("/api/tasks", json={"text": "x"}, headers={"Authorization": ""}).status_code == 401
-    srv.api.dev_token = "s3cret"
-    assert c.get("/api/today", headers={"Authorization": "dev s3cret"}).status_code == 200
+    srv.api.dev_token = "s3cret"                          # короче 32 символов: не принимается
+    assert c.get("/api/today", headers={"Authorization": "dev s3cret"}).status_code == 401
+    long_tok = "d" * 40
+    srv.api.dev_token = long_tok
+    assert c.get("/api/today", headers={"Authorization": f"dev {long_tok}"}).status_code == 200
     assert c.get("/api/today", headers={"Authorization": "dev wrong"}).status_code == 401
     assert c.get("/api/nope").status_code == 404
     assert c.get("/api/tasks").status_code == 405

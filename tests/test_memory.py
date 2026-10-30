@@ -202,6 +202,43 @@ def test_people_dry_run_writes_nothing(admin, reader):
         assert n(admin, f"SELECT count(*) AS n FROM work.{t}") == 0
 
 
+def test_candidate_choice_for_shared_bare_name_is_scoped_to_meeting(admin, as_role):
+    """«Саша» -> Петров, а в контексте есть ещё Александр Иванов: обличье на весь контекст не пишем."""
+    from types import SimpleNamespace
+    from bot import candidates
+
+    def mk(name):
+        pid = admin.execute("INSERT INTO work.people (display_name) VALUES (%s) RETURNING id", (name,)).fetchone()["id"]
+        admin.execute("INSERT INTO work.person_contexts (person_id, context_id) VALUES (%s, 'infatica')", (pid,))
+        return pid
+    petrov, ivanov = mk("Саша Петров"), mk("Александр Иванов")
+    yan = admin.execute("INSERT INTO work.people (display_name) VALUES ('Ян Кузнецов') RETURNING id").fetchone()["id"]
+    mt = ev(admin, "plaud", "infatica", "meeting", "SDK синк", "Саша обещал логи.", {"participant_ids": [ivanov]})
+
+    def cand(raw):
+        return admin.execute("INSERT INTO work.identity_candidates (raw, kind, source_event, context_id) "
+                             "VALUES (%s, 'display_name', %s, 'infatica') RETURNING id", (raw, mt)).fetchone()["id"]
+    edits = []
+    ctx = SimpleNamespace(conn=as_role("workos_bot"), edit=lambda mid, text, buttons: edits.append(text))
+    cq = {"message": {"message_id": 7}}
+
+    assert candidates.on_callback(ctx, cq, ["idc", str(cand("Саша")), str(petrov)]) == "Запомнил"
+    assert n(admin, "SELECT count(*) AS n FROM work.identities WHERE value = 'Саша'") == 0
+    meta = admin.execute("SELECT meta FROM work.events WHERE id = %s", (mt,)).fetchone()["meta"]
+    assert sorted(meta["participant_ids"]) == sorted([ivanov, petrov])
+    assert "это Саша Петров" in edits[-1] and "только для этой встречи" in edits[-1] and "—" not in edits[-1]
+
+    # то же для голого «Шура» (уменьшительное от Александра Иванова)
+    candidates.on_callback(ctx, cq, ["idc", str(cand("Шура")), str(petrov)])
+    assert n(admin, "SELECT count(*) AS n FROM work.identities WHERE value = 'Шура'") == 0
+    assert "только для этой встречи" in edits[-1]
+
+    # имя, которое в контексте больше никто не носит, запоминается как раньше
+    candidates.on_callback(ctx, cq, ["idc", str(cand("Ян")), str(yan)])
+    row = admin.execute("SELECT person_id, context_id FROM work.identities WHERE value = 'Ян'").fetchone()
+    assert row["person_id"] == yan and row["context_id"] == "infatica" and "только" not in edits[-1]
+
+
 def test_unlinked_meeting_waits_for_calendar(admin, reader):
     ev(admin, "plaud", "infatica", "meeting", "Без календаря", "Саша и Маша спорили.", {})
     r = people.run()
@@ -283,21 +320,33 @@ def test_backfill_fills_embedding_and_model(admin, reader, fake_embed):
                                                 "decisions_todo": 1, "dry_run": True}
     before = n(admin, "SELECT count(*) AS n FROM public.usage_log WHERE command = 'work_embed'")
     r = embed_backfill.run(batch=1)
-    assert r["events"] == 2 and r["decisions"] == 1 and r["seconds"] >= 0
+    assert r["events"] == 2 and r["decisions"] == 1 and r["seconds"] >= 0 and r["partial"] is False
     rows = {r["id"]: r for r in admin.execute("SELECT id, embedding, embedding_model FROM work.events")}
     for i in (a, b):
         assert rows[i]["embedding_model"] == "fake-hash-768" and len(rows[i]["embedding"]) == 768
     assert rows[old]["embedding"] is None and rows[empty]["embedding"] is None
     dec = admin.execute("SELECT embedding, embedding_model FROM work.decisions WHERE id = %s", (d,)).fetchone()
     assert dec["embedding_model"] == "fake-hash-768" and len(dec["embedding"]) == 768
-    log = admin.execute("SELECT cost_usd, tokens FROM public.usage_log WHERE command = 'work_embed' "
-                        "ORDER BY id DESC LIMIT 1").fetchone()
-    assert n(admin, "SELECT count(*) AS n FROM public.usage_log WHERE command = 'work_embed'") == before + 1
-    assert log["tokens"] == 3 and log["cost_usd"] == 0
+    # учёт по пачке: убитый посреди прогон всё равно оставляет строки
+    logs = admin.execute("SELECT cost_usd, tokens FROM public.usage_log WHERE command = 'work_embed' "
+                         "ORDER BY id DESC LIMIT 3").fetchall()
+    assert n(admin, "SELECT count(*) AS n FROM public.usage_log WHERE command = 'work_embed'") == before + 3
+    assert [x["tokens"] for x in logs] == [1, 1, 1] and all(x["cost_usd"] == 0 for x in logs)
     assert embed_backfill.run()["events"] == 0
     # смена модели: старые векторы несравнимы, строка считается заново
     admin.execute("UPDATE work.events SET embedding_model = 'old-model' WHERE id = %s", (b,))
     assert embed_backfill.run()["events"] == 1
+
+
+def test_backfill_is_time_bounded(admin, reader, fake_embed, monkeypatch):
+    for i in range(3):
+        ev(admin, "gmail:personal", "personal", "email", f"Письмо {i}", "текст", days_ago=i + 1)
+    clock = itertools.count(0, 60)                       # каждый взгляд на часы: +1 минута
+    monkeypatch.setattr(embed_backfill.time, "monotonic", lambda: next(clock))
+    r = embed_backfill.run(batch=1, max_minutes=2)
+    assert r["partial"] is True and 0 < r["events"] < 3
+    rest = embed_backfill.run(batch=1, max_minutes=None)  # следующая ночь доделывает остальное
+    assert rest["partial"] is False and r["events"] + rest["events"] == 3
 
 
 def test_backfill_text_is_trimmed():

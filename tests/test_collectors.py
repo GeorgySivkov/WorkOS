@@ -120,6 +120,11 @@ def test_trello_cards_and_mirror(admin, mk_source, role_env, monkeypatch):
     r3 = run_source("trello:test", TrelloCollector(src(admin, "trello:test"), transport=t))
     assert r3["inserted"] == 0 and r3["updated"] == 1
     assert {e["external_id"]: e for e in events(admin, "trello:test")}["c1"]["meta"]["list"] == "Done"
+    # описание поправили: body остаётся прежним, текущее описание в meta.desc
+    cards["c1"] = dict(cards["c1"], desc="описание v2", dateLastActivity=zulu(tu.now()))
+    r4 = run_source("trello:test", TrelloCollector(src(admin, "trello:test"), transport=t))
+    c1 = {e["external_id"]: e for e in events(admin, "trello:test")}["c1"]
+    assert r4["updated"] == 1 and c1["body"] == "описание" and c1["meta"]["desc"] == "описание v2"
 
     info = whoami(transport=t)
     assert info["me"]["username"] == "george" and info["boards"][0]["idOrganization"] == "O1"
@@ -197,6 +202,90 @@ def test_plaud_transcript_ready_and_calendar_match(admin, mk_source, role_env, m
     assert "old" not in rows
 
 
+def test_plaud_late_upload_and_late_transcript(admin, mk_source, role_env, monkeypatch):
+    """Запись старше метки не теряется: транскрипт дозрел позже (pending) или файл залили поздно."""
+    from collectors.plaud import PlaudCollector
+    monkeypatch.setenv("PLAUD_TOKEN", "tok")
+    role_env("workos_reader")
+    now = tu.now()
+
+    def ms(delta: timedelta) -> int:
+        return int((now - delta).timestamp() * 1000)
+
+    recs = {
+        "a": {"id": "a", "filename": "A", "start_time": ms(timedelta(hours=1)), "duration": 1000, "is_trans": 1},
+        "b": {"id": "b", "filename": "B", "start_time": ms(timedelta(hours=2)), "duration": 1000, "is_trans": 0},
+        "c": {"id": "c", "filename": "C", "start_time": ms(timedelta(hours=30)), "duration": 1000, "is_trans": 1},
+        "old": {"id": "old", "filename": "Давно", "start_time": ms(timedelta(days=10)), "duration": 1000,
+                "is_trans": 1},
+    }
+    texts = {"a": "первая", "b": "вторая", "old": "старая"}       # у «c» флаг есть, а текста ещё нет
+    lists: list[int] = []
+    asked: list[list[str]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/file/simple/web":
+            skip, limit = int(req.url.params["skip"]), int(req.url.params["limit"])
+            lists.append(skip)
+            lst = sorted(recs.values(), key=lambda r: -r["start_time"])[skip:skip + limit]
+            return httpx.Response(200, json={"data_file_list": lst})
+        ids = json.loads(req.content)
+        asked.append(ids)
+        out = [{**recs[i], "trans_result": [{"speaker": "Я", "content": texts[i]}] if i in texts else []}
+               for i in ids if i in recs]
+        return httpx.Response(200, json={"data_file_list": out})
+
+    t = httpx.MockTransport(handler)
+    s = mk_source("plaud:late", "plaud", None, {"page_size": 2}, lookback=0)
+    # прогон 1: «a» готова, «b» без транскрипта (ждём), «c» с флагом, но без текста (ждём), «old» до WorkOS
+    r1 = run_source("plaud:late", PlaudCollector(s, transport=t))
+    assert r1["inserted"] == 1
+    st = json.loads(src(admin, "plaud:late")["watermark"])
+    assert set(st["pending"]) == {"b", "c"} and st["floor"]
+    assert "b" not in asked[0]                                    # свежий «нет транскрипта» не перепроверяем
+
+    # прогон 2 (обычный): метка = начало прогона 1, все записи уже старше неё.
+    # «b» дозрела, у «c» появился текст: оба из pending, хоть и старше метки.
+    # «d» залили с телефона поздно (запись суточной давности), она за учтённой страницей
+    recs["b"]["is_trans"] = 1
+    texts["c"] = "третья"
+    recs["d"] = {"id": "d", "filename": "D", "start_time": ms(timedelta(hours=26)), "duration": 1000, "is_trans": 1}
+    texts["d"] = "поздняя"
+    lists.clear()
+    run_source("plaud:late", PlaudCollector(src(admin, "plaud:late"), transport=t))
+    got = {e["external_id"]: e for e in events(admin, "plaud:late")}
+    assert set(got) == {"a", "b", "c"} and got["c"]["body"] == "Я: третья"
+    assert lists == [0]                                           # первая страница учтена целиком
+    st = json.loads(src(admin, "plaud:late")["watermark"])
+    assert st["pending"] == {}
+
+    # прогон 3 (глубокий, раз в час): листаем до 30 дней назад и находим позднюю загрузку
+    wm = json.loads(src(admin, "plaud:late")["watermark"])
+    wm["scanned_at"] = (now - timedelta(hours=2)).isoformat()
+    admin.execute("UPDATE work.sources SET watermark = %s WHERE id = 'plaud:late'", (json.dumps(wm),))
+    lists.clear()
+    run_source("plaud:late", PlaudCollector(src(admin, "plaud:late"), transport=t))
+    got = {e["external_id"]: e for e in events(admin, "plaud:late")}
+    assert set(got) == {"a", "b", "c", "d"} and got["d"]["body"] == "Я: поздняя"
+    assert "old" not in got                                       # до первого прогона: не тянем
+    assert lists == [0, 2, 4]
+
+    # прогон 4: всё учтено, первая же страница старше метки и известна: дальше не листаем
+    lists.clear()
+    asked.clear()
+    r4 = run_source("plaud:late", PlaudCollector(src(admin, "plaud:late"), transport=t))
+    assert r4["inserted"] == 0 and lists == [0] and asked == []
+
+    # срок ожидания: запись без транскрипта старше 30 дней из pending выпадает
+    from collectors.plaud import PlaudCollector as PC
+    stale = dict(src(admin, "plaud:late"))
+    stale["watermark"] = json.dumps({"cursor": now.isoformat(), "floor": (now - timedelta(days=40)).isoformat(),
+                                     "pending": {"ghost": (now - timedelta(days=31)).isoformat()}})
+    col = PC(stale, transport=t)
+    col.collect()
+    assert col.state["pending"] == {}
+
+
 # ---------------- iCal ----------------
 ICS = """BEGIN:VCALENDAR
 VERSION:2.0
@@ -231,6 +320,12 @@ STATUS:CANCELLED
 SEQUENCE:2
 END:VEVENT
 {single}BEGIN:VEVENT
+UID:{mirror}@google.com
+DTSTART:20261028T170000Z
+DTEND:20261028T180000Z
+SUMMARY:Копия из зеркала
+END:VEVENT
+BEGIN:VEVENT
 UID:allday@x
 DTSTART;VALUE=DATE:20261029
 DTEND;VALUE=DATE:20261030
@@ -254,7 +349,10 @@ def test_ical_recurring_exceptions_and_disappearance(admin, mk_source, role_env,
     from collectors.calendar import ICalCollector
     monkeypatch.setenv("ICAL_TEST_URL", "https://calendar.google.com/calendar/ical/secret/basic.ics")
     role_env("workos_reader")
-    feed = {"text": ICS.replace("{count}", "4").replace("{single}", SINGLE)}
+    from executors.calendar import block_id, mirror_id
+    mirror_uid = mirror_id("eas:alfa", "u1", "")
+    ics = ICS.replace("{mirror}", mirror_uid)
+    feed = {"text": ics.replace("{count}", "4").replace("{single}", SINGLE)}
 
     def handler(req):
         assert req.url.host == "calendar.google.com"
@@ -283,13 +381,16 @@ def test_ical_recurring_exceptions_and_disappearance(admin, mk_source, role_env,
     allday = rows["allday@x|"]
     assert allday["meta"]["all_day"] is True and allday["meta"]["busy"] is False
     assert allday["occurred_at"] == datetime(2026, 10, 28, 23, 0, tzinfo=UTC)   # полночь по Мадриду
+    assert not any(k.startswith(mirror_uid) for k in rows)       # копия зеркала в базу не вернулась
+    from collectors.calendar import OWN_UID_RE
+    assert OWN_UID_RE.match(block_id(42) + "@google.com") and not OWN_UID_RE.match("abc123@google.com")
 
     # повторный прогон той же ленты ничего не меняет
     r2 = run_source("ical:test", ICalCollector(src(admin, "ical:test"), transport=t, now=now))
     assert r2["inserted"] == 0 and r2["updated"] == 0
 
     # разовую встречу удалили, серию укоротили: исчезнувшее стало cancelled, строки на месте
-    feed["text"] = ICS.replace("{count}", "3").replace("{single}", "")
+    feed["text"] = ics.replace("{count}", "3").replace("{single}", "")
     run_source("ical:test", ICalCollector(src(admin, "ical:test"), transport=t, now=now))
     feed_rows = {r["external_id"]: r for r in admin.execute(
         "SELECT external_id, status, busy FROM work.calendar_feed WHERE source_id = 'ical:test'").fetchall()}
@@ -317,14 +418,18 @@ def test_slack_history_threads_mentions(admin, mk_source, role_env, monkeypatch)
         return f"{base - minutes_ago * 60:.6f}"
 
     T1, T2, T3, T5, T6 = ts(50), ts(40), ts(30), ts(20), ts(10)
+    T0, TR = ts(60 * 24 * 10), ts(5)              # тред десятидневной давности ожил сейчас
     history = [
-        {"type": "message", "user": "U1", "text": "всем привет", "ts": T1},
+        {"type": "message", "user": "U1", "text": "всем привет (поправил)", "ts": T1, "edited": {"ts": T5}},
         {"type": "message", "user": "U2", "text": "релиз SDK", "ts": T2, "thread_ts": T2, "reply_count": 1,
          "latest_reply": T3},
         {"type": "message", "subtype": "channel_join", "user": "U3", "text": "joined", "ts": ts(45)},
     ]
     replies = {
         ("C1", T2): [history[1], {"type": "message", "user": "U1", "text": "<@UME> глянь", "ts": T3, "thread_ts": T2}],
+        ("C1", T0): [{"type": "message", "user": "U2", "text": "старый тред", "ts": T0, "thread_ts": T0,
+                      "reply_count": 1, "latest_reply": TR},
+                     {"type": "message", "user": "U1", "text": "а вот и ответ", "ts": TR, "thread_ts": T0}],
         ("C9", T5): [{"type": "message", "user": "U2", "text": "вопрос", "ts": T5, "thread_ts": T5, "reply_count": 1},
                      {"type": "message", "user": "U2", "text": "<@UME> ответишь?", "ts": T6, "thread_ts": T5,
                       "edited": {"ts": T6}}],
@@ -346,6 +451,13 @@ def test_slack_history_threads_mentions(admin, mk_source, role_env, monkeypatch)
             return httpx.Response(200, json={"ok": True, "messages": msgs, "has_more": False})
         if method == "conversations.replies":
             return httpx.Response(200, json={"ok": True, "messages": replies[(q["channel"], q["ts"])]})
+        if method == "search.messages" and q["query"].startswith("in:<#C1> after:"):
+            return httpx.Response(200, json={"ok": True, "messages": {
+                "matches": [{"channel": {"id": "C1"}, "ts": TR, "text": "а вот и ответ",
+                             "permalink": f"https://x.slack.com/archives/C1/p2?thread_ts={T0}&cid=C1"},
+                            {"channel": {"id": "C1"}, "ts": T1, "text": "всем привет",
+                             "permalink": "https://x.slack.com/archives/C1/p1"}],
+                "paging": {"page": 1, "pages": 1}}})
         if method == "search.messages":
             assert q["query"].startswith("<@UME> after:")
             return httpx.Response(200, json={"ok": True, "messages": {
@@ -362,9 +474,12 @@ def test_slack_history_threads_mentions(admin, mk_source, role_env, monkeypatch)
     s = mk_source("slack:test", "slack", "infatica", {"channels": ["C1"], "user_id": "UME"}, lookback=2)
     r1 = run_source("slack:test", SlackCollector(s, transport=t, sleep=slept.append))
     assert slept == [1.0]                                    # 429 + Retry-After уважили
-    assert r1["inserted"] == 5
+    assert r1["inserted"] == 7
     rows = {e["external_id"]: e for e in events(admin, "slack:test")}
-    assert set(rows) == {f"C1:{T1}", f"C1:{T2}", f"C1:{T3}", f"C9:{T5}", f"C9:{T6}"}
+    assert set(rows) == {f"C1:{T1}", f"C1:{T2}", f"C1:{T3}", f"C9:{T5}", f"C9:{T6}", f"C1:{T0}", f"C1:{TR}"}
+    assert rows[f"C1:{TR}"]["thread_key"] == f"C1:{T0}"            # ответ в старый тред нашёл поиск
+    assert rows[f"C1:{T1}"]["meta"]["text"] == "всем привет (поправил)"   # правка видна в meta.text
+    assert "text" not in rows[f"C1:{T2}"]["meta"]
     reply = rows[f"C1:{T3}"]
     assert reply["thread_key"] == f"C1:{T2}" and reply["meta"]["mentions_me"] is True
     assert reply["actor_raw"] == "U1" and reply["meta"]["user_name"] == "Имя U1"
@@ -375,11 +490,15 @@ def test_slack_history_threads_mentions(admin, mk_source, role_env, monkeypatch)
     st = json.loads(src(admin, "slack:test")["watermark"])
     assert st["channels"]["C1"] == T2 and f"C1|{T2}" in st["threads"]
     assert calls.count("users.info") == 2                    # имена кешируются
+    assert f"C1|{T0}" in st["threads"]                       # оживший тред теперь живой
 
-    # второй прогон: всё уже есть, треды перечитаны, дублей нет
+    # второй прогон: всё уже есть, треды перечитаны, дублей нет; новая правка попала в meta.text
+    history[0] = dict(history[0], text="всем привет (ещё раз)")
     r2 = run_source("slack:test", SlackCollector(src(admin, "slack:test"), transport=t, sleep=slept.append))
     assert r2["inserted"] == 0
-    assert len(events(admin, "slack:test")) == 5
+    assert len(events(admin, "slack:test")) == 7
+    first = {e["external_id"]: e for e in events(admin, "slack:test")}[f"C1:{T1}"]
+    assert first["meta"]["text"] == "всем привет (ещё раз)" and first["body"] == "всем привет (поправил)"
 
 
 # ---------------- Gmail ----------------
@@ -420,8 +539,10 @@ def test_gmail_first_run_history_and_404_fallback(admin, mk_source, role_env, mo
         "m4": _msg("m4", ["INBOX"], {"From": "noid@x", "Subject": "Без Message-ID"},
                    {"mimeType": "text/plain", "body": {"data": _b64("тело")}}, now - timedelta(minutes=30)),
     }
-    world = {"profile_history": "100", "listed": ["m1", "m2"]}
+    world = {"profile_history": "100", "listed": ["m1", "m2"], "limited": 0}
     seen: list[str] = []
+    queries: list[str] = []
+    slept: list[float] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
         if req.url.host == "oauth2.googleapis.com":
@@ -433,9 +554,12 @@ def test_gmail_first_run_history_and_404_fallback(admin, mk_source, role_env, mo
         q = dict(req.url.params)
         seen.append(p)
         if p == "/profile":
+            if world["limited"]:
+                world["limited"] -= 1
+                return httpx.Response(429, headers={"Retry-After": "1"})
             return httpx.Response(200, json={"historyId": world["profile_history"]})
         if p == "/messages":
-            assert q["q"] == "newer_than:2d"
+            queries.append(q["q"])
             return httpx.Response(200, json={"messages": [{"id": i} for i in world["listed"]]})
         if p == "/history":
             assert q["historyTypes"] == "messageAdded"
@@ -454,7 +578,7 @@ def test_gmail_first_run_history_and_404_fallback(admin, mk_source, role_env, mo
     s = mk_source("gmail:test", "gmail", "personal", {"refresh_env": "GMAIL_PERSONAL_REFRESH_TOKEN",
                                                       "account": "personal"}, lookback=2)
     r1 = run_source("gmail:test", GmailCollector(s, transport=t))
-    assert r1["inserted"] == 2
+    assert r1["inserted"] == 2 and queries == ["newer_than:2d"]       # первый прогон: метки нет
     rows = {e["external_id"]: e for e in events(admin, "gmail:test")}
     m1 = rows["<m1@infatica.io>"]
     assert m1["title"] == "Привет" and m1["body"] == "Привет, это текст."
@@ -473,13 +597,23 @@ def test_gmail_first_run_history_and_404_fallback(admin, mk_source, role_env, mo
     assert "/messages/m3" not in seen
     assert json.loads(src(admin, "gmail:test")["watermark"])["history_id"] == "120"
 
-    # метка устарела (404): откат на полный перечит без дублей
-    world.update(profile_history="130")
-    r3 = run_source("gmail:test", GmailCollector(src(admin, "gmail:test"), transport=t))
-    assert r3["inserted"] == 0
+    # метка устарела (404): откат на полный перечит без дублей, от прошлого прогона, а не за 2 дня
+    world.update(profile_history="130", limited=1)
+    cursor = datetime.fromisoformat(json.loads(src(admin, "gmail:test")["watermark"])["cursor"])
+    r3 = run_source("gmail:test", GmailCollector(src(admin, "gmail:test"), transport=t, sleep=slept.append))
+    assert r3["inserted"] == 0 and slept == [1.0]                    # 429 + Retry-After уважили
+    assert queries[-1] == f"after:{int((cursor - timedelta(days=3)).timestamp())}"
     wm = json.loads(src(admin, "gmail:test")["watermark"])
     assert wm["history_id"] == "130" and wm["mode"] == "full"
     assert len(events(admin, "gmail:test")) == 3
+
+    # простой 10 дней: откат читает всю почту с прошлого успешного прогона
+    old = tu.now() - timedelta(days=10)
+    admin.execute("UPDATE work.sources SET watermark = %s WHERE id = 'gmail:test'",
+                  (json.dumps({"cursor": old.isoformat(), "history_id": "5", "mode": "history"}),))
+    run_source("gmail:test", GmailCollector(src(admin, "gmail:test"), transport=t))
+    after = int(queries[-1].removeprefix("after:"))
+    assert after <= (old - timedelta(days=2)).timestamp()
 
 
 # ---------------- приёмник с Мака ----------------
@@ -579,6 +713,80 @@ def test_achat_sqlite_snapshot_to_ingest(admin, mk_source, ingest_server, tmp_pa
     assert len(events(admin, "achat:mac")) == 3
     con.close()
     assert list(tmp_path.glob("workos-achat-*")) == []
+
+
+def test_achat_seq_cursor_server_ids_and_heartbeat(admin, mk_source, ingest_server, tmp_path, monkeypatch):
+    """Метка по Z_PK: докачанный задним числом чат не теряется. server_id: после переустановки
+    А-Чата (Z_PK заново) дублей нет. Нового нет: пустая пачка, дроплет видит, что Мак жив."""
+    ac = _achat_module()
+    monkeypatch.setattr(ac, "STATE", tmp_path / "achat.state")
+    mk_source("achat:seq", "achat", "alfa")
+    now = datetime.now(UTC)
+
+    def make_db(path, rows):
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE ZMSG (Z_PK INTEGER PRIMARY KEY, ZSRV TEXT, ZDATE REAL, ZCHAT TEXT, "
+                    "ZAUTHOR TEXT, ZTEXT TEXT)")
+        for pk, srv, ago, text in rows:
+            con.execute("INSERT INTO ZMSG VALUES (?, ?, ?, 'Поддержка', 'Ян', ?)",
+                        (pk, srv, (now - ago).timestamp() - ac.COREDATA_EPOCH, text))
+        con.commit()
+        con.close()
+
+    dbp = tmp_path / "store.sqlite"
+    make_db(dbp, [(1, "s1", timedelta(minutes=30), "раз"), (2, "s2", timedelta(minutes=10), "два"),
+                  (3, "s0", timedelta(days=5), "старьё до первого прогона")])
+    cfg = {"mode": "sqlite", "db_path": str(dbp), "ts_format": "coredata",
+           "query": "SELECT Z_PK AS seq, ZSRV AS server_id, Z_PK AS id, ZDATE AS ts, ZCHAT AS chat, "
+                    "ZAUTHOR AS author, ZTEXT AS text FROM ZMSG WHERE Z_PK > :seq ORDER BY Z_PK",
+           "ingest_url": ingest_server, "token": TOKEN, "source_id": "achat:seq", "initial_days": 1}
+    assert ac.run(cfg) == {"rows": 2, "sent": 2}
+    assert {r["external_id"] for r in events(admin, "achat:seq")} == {"srv:s1", "srv:s2"}
+    assert json.loads((tmp_path / "achat.state").read_text())["seq"] == 3
+
+    # приложение докачало старый чат: сообщения трёхдневной давности, но с новыми Z_PK
+    con = sqlite3.connect(dbp)
+    con.execute("INSERT INTO ZMSG VALUES (4, 's-old', ?, 'Архив', 'Анна', 'докачано')",
+                ((now - timedelta(days=3)).timestamp() - ac.COREDATA_EPOCH,))
+    con.commit()
+    con.close()
+    assert ac.run(cfg) == {"rows": 1, "sent": 1}
+    old = [r for r in events(admin, "achat:seq") if r["external_id"] == "srv:s-old"]
+    assert len(old) == 1 and old[0]["occurred_at"] < now - timedelta(days=2)
+
+    # тихие выходные: нового нет, но last_ok_at обновился (нет ложной тревоги «А-Чат молчит»)
+    admin.execute("UPDATE work.sources SET last_ok_at = NULL WHERE id = 'achat:seq'")
+    assert ac.run(cfg) == {"rows": 0, "sent": 0}
+    assert src(admin, "achat:seq")["last_ok_at"] is not None
+
+    # переустановка А-Чата: та же переписка, но Z_PK с нуля и в другом порядке
+    dbp.unlink()
+    make_db(dbp, [(1, "s-old", timedelta(days=3), "докачано"), (2, "s2", timedelta(minutes=10), "два"),
+                  (3, "s1", timedelta(minutes=30), "раз"), (4, "s3", timedelta(minutes=1), "новое")])
+    res = ac.run(cfg)
+    assert res["sent"] >= 1
+    ids = [r["external_id"] for r in events(admin, "achat:seq")]
+    assert sorted(ids) == ["srv:s-old", "srv:s1", "srv:s2", "srv:s3"]          # без дублей
+    assert ac.run(cfg) == {"rows": 0, "sent": 0}
+
+
+def test_achat_permission_error_is_explained(tmp_path, monkeypatch, capsys):
+    ac = _achat_module()
+    monkeypatch.setattr(ac, "STATE", tmp_path / "achat.state")
+    cfgp = tmp_path / "achat.json"
+    cfgp.write_text(json.dumps({"mode": "sqlite", "db_path": str(tmp_path / "x.sqlite"), "query": "SELECT 1",
+                                "ingest_url": "http://127.0.0.1:9", "token": "t", "source_id": "achat:x"}))
+    cfgp.chmod(0o600)
+
+    def denied(path):
+        raise ac.AccessDenied(f"нет доступа к {path} ([Errno 1] Operation not permitted)")
+    monkeypatch.setattr(ac, "snapshot", denied)
+    assert ac.main(["--config", str(cfgp)]) == 1
+    out = capsys.readouterr().out
+    assert "Full Disk Access" in out and "нет доступа" in out
+    assert ac._is_access_error(sqlite3.OperationalError("unable to open database file"))
+    assert not ac._is_access_error(sqlite3.OperationalError("no such table: ZMSG"))
+    assert not (tmp_path / "achat.state").exists()
 
 
 def test_achat_notifications_fallback(tmp_path):

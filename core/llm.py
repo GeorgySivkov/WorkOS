@@ -10,7 +10,6 @@ import json
 import os
 import re
 import subprocess
-import time
 
 from core import config, db
 
@@ -39,29 +38,49 @@ def _log_usage(task: str, cost, tokens) -> None:
         pass  # учёт расходов никогда не роняет пайплайн
 
 
+# что из окружения нужно claude CLI; PGPASSWORD, токены Telegram и Google туда не идут
+ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "CLAUDE_CODE_OAUTH_TOKEN")
+
+
+def child_env() -> dict[str, str]:
+    env = {k: os.environ[k] for k in ENV_KEEP if os.environ.get(k)}
+    env.update({k: v for k, v in os.environ.items() if k.startswith("CLAUDE_") and v})
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    return env
+
+
 def complete(task: str, system: str, user: str, timeout: int = 240) -> str:
     if config.ROLE == "executor":
         raise LLMError("исполнитель не вызывает модель по контракту (шаг 5.1)")
     if _fake is not None:
         return _fake(task, system, user)
     model = config.model_for(task)
-    cmd = [config.env("CLAUDE_BIN", "claude"), "-p", user,
+    # промпт (тела писем, расшифровки) идёт через stdin: в argv его видно в /proc/*/cmdline,
+    # и там предел ~128 КБ на аргумент; системный промпт фиксированный, ему можно в argv
+    cmd = [config.env("CLAUDE_BIN", "claude"), "-p",
            "--system-prompt", system + " Не используй инструменты и не пиши файлы, верни только ответ.",
            "--output-format", "json", "--max-turns", "2", "--model", model,
            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
            "--disallowedTools", DENY]
-    t0 = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=os.environ.copy())
+        proc = subprocess.run(cmd, input=user, capture_output=True, text=True, timeout=timeout,
+                              env=child_env())
     except FileNotFoundError as e:
+        _log_usage(task, None, None)
         raise LLMError("claude CLI не найден: поставь Claude Code и сделай claude setup-token") from e
     except subprocess.TimeoutExpired as e:
+        _log_usage(task, None, None)
         raise LLMError(f"модель не ответила за {timeout} с") from e
     if proc.returncode != 0:
+        _log_usage(task, None, None)
         raise LLMError(f"claude -p exit {proc.returncode}: {(proc.stderr or proc.stdout)[:500]}")
     try:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError:
+        _log_usage(task, None, None)
+        return proc.stdout
+    if not isinstance(payload, dict):
+        _log_usage(task, None, None)
         return proc.stdout
     u = payload.get("usage") or {}
     toks = sum(int(u.get(k, 0) or 0) for k in ("input_tokens", "output_tokens",
@@ -69,7 +88,6 @@ def complete(task: str, system: str, user: str, timeout: int = 240) -> str:
     _log_usage(task, payload.get("total_cost_usd"), toks)
     if payload.get("is_error"):
         raise LLMError(str(payload.get("result"))[:500])
-    _ = time.time() - t0
     return payload.get("result", "") or ""
 
 

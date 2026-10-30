@@ -68,8 +68,7 @@ def _item(text: str, day: date | None) -> dict | None:
     m = RX_TIME.search(t)
     if m and day and int(m.group(1)) <= 23 and int(m.group(2)) <= 59:
         def at(h, mi):
-            d = day + timedelta(days=1) if int(h) < config.LOGICAL_DAY_END_HOUR else day
-            return tu.at_local(d, tu.parse_hm(f"{int(h)}:{mi}"))
+            return tu.local_dt_for(day, tu.parse_hm(f"{int(h)}:{mi}"))
         start = at(m.group(1), m.group(2))
         if m.group(3) and int(m.group(3)) <= 23 and int(m.group(4)) <= 59:
             end = at(m.group(3), m.group(4))
@@ -83,7 +82,8 @@ def _item(text: str, day: date | None) -> dict | None:
         return None
     item = {"title": title[:300], "size": size}
     if start:
-        item["start"], item["end"] = start.isoformat(), end.isoformat()
+        # время George написал сам: это ручной план, replan и dayplan его не двигают
+        item["start"], item["end"], item["fixed"] = start.isoformat(), end.isoformat(), True
     return item
 
 
@@ -151,16 +151,18 @@ def handle_paste(ctx: Ctx, msg: dict) -> bool:
     eid = capture.store_event(ctx, msg, body=text, meta={"plan_paste": True})
     if eid is None:
         return True                                # повторная доставка: карточка уже есть
-    with conn.transaction():
-        aid = conn.execute(
-            """INSERT INTO work.actions (context_id, type, payload, rationale, source_event, status, autonomy)
-               VALUES ('personal', 'plan_batch', %s, %s, %s, 'proposed', 'approval') RETURNING id""",
-            (db.jb(payload), "Вечерний план, вставлен в чат", eid)).fetchone()["id"]
-        capture.merge_meta(conn, eid, {"action_id": aid})
-    try:
-        cards.post_card(ctx, aid, direct=True)
-    except Exception:
-        log.exception("карточка плана %s", aid)      # тик покажет её через outbox
+    # под общим замком: фоновый тик не успеет увидеть строку без карточки и одобрить её сам
+    with ctx.lock:
+        with conn.transaction():
+            aid = conn.execute(
+                """INSERT INTO work.actions (context_id, type, payload, rationale, source_event, status, autonomy)
+                   VALUES ('personal', 'plan_batch', %s, %s, %s, 'proposed', 'approval') RETURNING id""",
+                (db.jb(payload), "Вечерний план, вставлен в чат", eid)).fetchone()["id"]
+            capture.merge_meta(conn, eid, {"action_id": aid})
+        try:
+            cards.post_card(ctx, aid, direct=True)
+        except Exception:
+            log.exception("карточка плана %s", aid)      # тик покажет её через outbox
     return True
 
 
@@ -196,12 +198,17 @@ def _when(it: dict) -> str:
         return ""
 
 
+def _moved(it: dict) -> str:
+    """Пункт двигает уже существующую задачу (task_id), а не заводит новую."""
+    return " · перенос" if it.get("task_id") else ""
+
+
 def items_text(p: dict, mask: int | None = None) -> str:
     lines = []
     items = p.get("items") or []
     for i, it in enumerate(items):
         off = mask is not None and not (mask >> i) & 1
-        line = f"{_when(it)}{esc(it.get('title'))} · {esc(it.get('size') or 'S')}"
+        line = f"{_when(it)}{esc(it.get('title'))} · {esc(it.get('size') or 'S')}{_moved(it)}"
         lines.append(f"• <s>{line}</s>" if off else f"• {line}")
     week = p.get("week_items") or []
     if week:
@@ -209,7 +216,7 @@ def items_text(p: dict, mask: int | None = None) -> str:
         for j, it in enumerate(week):
             i = len(items) + j
             off = mask is not None and not (mask >> i) & 1
-            line = esc(it.get("title"))
+            line = esc(it.get("title")) + _moved(it)
             lines.append(f"• <s>{line}</s>" if off else f"• {line}")
     return "\n".join(lines)
 
@@ -269,21 +276,33 @@ def insert_tasks(conn, row: dict, selected: list[int] | None) -> list[int]:
         start = cards._ts(it.get("start")) if not is_week else None
         end = cards._ts(it.get("end")) if start else None
         ctx_id = it.get("context_id") if it.get("context_id") in cx else None
+        # время из вставленного текста George = ручное; время от расстановщика = auto
+        by = ("manual" if it.get("fixed") else "auto") if start else None
         tid = it.get("task_id")
-        if tid:
+        if tid is not None:
+            try:
+                tid = int(tid)
+            except (TypeError, ValueError):
+                tid = None
+        if tid is not None:
             # задача уже есть (перенос, просрочка): двигаем её, а не заводим дубль;
-            # время, поставленное руками, не трогаем
-            ex = conn.execute("""UPDATE work.tasks SET due = %s, week_of = %s,
-                                   planned_start = CASE WHEN planned_by = 'manual' THEN planned_start ELSE %s END,
-                                   planned_end   = CASE WHEN planned_by = 'manual' THEN planned_end ELSE %s END,
-                                   planned_by    = CASE WHEN planned_by = 'manual' THEN planned_by ELSE %s END,
-                                   planned_at    = now()
-                                 WHERE id = %s AND done_at IS NULL AND dropped_at IS NULL RETURNING id""",
-                              (None if is_week else d, monday if is_week else None, start, end,
-                               "auto" if start else None, int(tid))).fetchone()
+            # время, поставленное руками, не трогаем; planned_at только если время сдвинулось
+            ex = conn.execute("""UPDATE work.tasks SET due = %(due)s, week_of = %(wk)s,
+                                   planned_start = CASE WHEN planned_by = 'manual' THEN planned_start ELSE %(s)s END,
+                                   planned_end   = CASE WHEN planned_by = 'manual' THEN planned_end ELSE %(e)s END,
+                                   planned_by    = CASE WHEN planned_by = 'manual' THEN planned_by ELSE %(by)s END,
+                                   planned_at    = CASE WHEN planned_by = 'manual'
+                                                         OR (planned_start IS NOT DISTINCT FROM %(s)s::timestamptz
+                                                             AND planned_end IS NOT DISTINCT FROM %(e)s::timestamptz)
+                                                        THEN planned_at ELSE now() END
+                                 WHERE id = %(id)s AND done_at IS NULL AND dropped_at IS NULL RETURNING id""",
+                              {"due": None if is_week else d, "wk": monday if is_week else None,
+                               "s": start, "e": end, "by": by, "id": tid}).fetchone()
             if ex:
                 ids.append(ex["id"])
                 continue
+            if conn.execute("SELECT 1 FROM work.tasks WHERE id = %s", (tid,)).fetchone():
+                continue                   # уже сделана или снята: дубль не заводим
         ids.append(conn.execute(
             """INSERT INTO work.tasks (context_id, title, due, week_of, size, cell_id, source, action_id,
                                        planned_start, planned_end, planned_at, planned_by)
@@ -292,7 +311,7 @@ def insert_tasks(conn, row: dict, selected: list[int] | None) -> list[int]:
              None if is_week else d, monday if is_week else None,
              it.get("size") if it.get("size") in ("S", "M", "L") else "S",
              it.get("cell_id") if it.get("cell_id") in cl else None,
-             row["id"], start, end, tu.now() if start else None, "auto" if start else None)).fetchone()["id"])
+             row["id"], start, end, tu.now() if start else None, by)).fetchone()["id"])
     return ids
 
 

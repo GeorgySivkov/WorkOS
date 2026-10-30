@@ -47,11 +47,13 @@ Env `.env.app`: PG* роли workos_app, `TELEGRAM_BOT_ID`, `TELEGRAM_OWNER_ID`,
   Дата и время из текста через `core.ruparse`; bucket используется, если в тексте даты нет.
   source='app', клетку и размер позже ставит читатель.
 - `POST /api/tasks/{id}/done` -> `{"task": {...}, "xp": 25, "level_up": false, "character": {...}}`
-  (done_at = now, `rpg.award_task`).
+  (done_at = now, `rpg.award_task`). `level_up` true только при первом достижении уровня (`rpg.app_level_up`).
 - `POST /api/tasks/{id}/undone` -> `{"task": {...}, "character": {...}}` (`rpg.revoke_task`).
 - `POST /api/tasks/{id}/tomorrow` -> задача (due = завтра, время снято, напоминание сдвинуто на сутки).
 - `POST /api/tasks/{id}/drop` -> `{"ok": true}` (dropped_at = now).
-- `POST /api/habits/{cell_id}/toggle` -> `{"done": true, "xp": 10, "character": {...}}`.
+- `POST /api/habits/{cell_id}/toggle` -> `{"done": true, "xp": 10, "character": {...}}`. Если привычка уже засчитана
+  не вручную (задача на этой клетке, Garmin), ответ `{"done": true, "xp": 0, "locked": true}` и ничего не пишется.
+  При достигнутом потолке дня отметка сохраняется с 0 опыта, серия не рвётся.
 - `POST /api/replan` -> то же, что `/api/today`, после пересборки несделанного с текущей минуты.
 - `GET /api/character` ->
 ```json

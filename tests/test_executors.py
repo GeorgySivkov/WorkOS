@@ -307,6 +307,60 @@ def test_validator_accepts_nulls_for_optional():
         base.validate("email_reply", {"account": "personal", "to": [], "cc": [], "subject": "s", "body": "b"})
 
 
+def test_claim_is_committed_before_external_call(admin, fake, monkeypatch):
+    """Внешний вызов идёт вне транзакции: executed_at уже закоммичен и виден снаружи."""
+    from executors import slack
+    aid = add_action(admin, "slack_post", {"channel": "C1", "text": "x"})
+    seen = {}
+    real = slack.execute
+
+    def spy(action, notify):
+        seen["row"] = admin.execute("SELECT status, executed_at FROM work.actions WHERE id = %s", (aid,)).fetchone()
+        return real(action, notify)
+    monkeypatch.setattr(slack, "execute", spy)
+    assert base.run_queue(once=True)["executed"] == 1
+    assert seen["row"]["status"] == "approved" and seen["row"]["executed_at"] is not None
+    row = action(admin, aid)
+    assert row["status"] == "executed" and row["result"]["ts"] == "1700000000.000100"
+
+
+class _Killed(BaseException):
+    """SIGKILL посреди внешнего вызова: процесс умер, до записи итога дело не дошло."""
+
+
+def test_killed_mid_action_is_not_retried_and_reported_once(admin, fake, monkeypatch):
+    from executors import slack
+    aid = add_action(admin, "slack_post", {"channel": "C1", "text": "x"})
+    calls = []
+
+    def dies(action, notify):
+        calls.append(action["id"])
+        raise _Killed()
+    monkeypatch.setattr(slack, "execute", dies)
+    with pytest.raises(_Killed):
+        base.run_queue(once=True)
+    row = action(admin, aid)
+    assert row["status"] == "approved" and row["executed_at"] is not None and row["result"] is None
+    # перезапуск: строку больше не берут, внешний вызов не повторяется
+    monkeypatch.setattr(slack, "execute", lambda a, n: calls.append(a["id"]) or {})
+    assert base.run_queue(once=True) == {"executed": 0, "drafted": 0, "failed": 0}
+    assert calls == [aid] and outbox(admin) == []          # свежую строку ещё не трогаем
+    # прошло больше 15 минут: одно сообщение в «Систему», второй раз не повторяется
+    admin.execute("UPDATE work.actions SET executed_at = now() - interval '20 minutes' WHERE id = %s", (aid,))
+    base.run_queue(once=True)
+    base.run_queue(once=True)
+    msgs = outbox(admin)
+    assert len(msgs) == 1 and msgs[0]["topic"] == "system" and msgs[0]["ref_action"] == aid
+    assert f"#{aid}" in msgs[0]["text"] and "сообщение в Slack" in msgs[0]["text"] and "—" not in msgs[0]["text"]
+    row = action(admin, aid)
+    assert row["status"] == "approved" and row["error"] == base.INTERRUPTED_ERROR and calls == [aid]
+    # готовый черновик (drafted с result) за прерванный не считается
+    did = add_action(admin, "slack_post", {"channel": "C1", "text": "y"}, status="drafted")
+    admin.execute("UPDATE work.actions SET executed_at = now() - interval '1 hour', result = '{}' WHERE id = %s",
+                  (did,))
+    assert base.sweep_interrupted() == 0
+
+
 def test_external_error_marks_failed(admin, fake, monkeypatch):
     monkeypatch.delenv("SLACK_WRITE_TOKEN")
     aid = add_action(admin, "slack_post", {"channel": "C1", "text": "x"})
@@ -334,19 +388,23 @@ def test_trello_card_happy_path(admin, fake):
     assert "nope" in outbox(admin)[0]["text"]
 
 
-def test_trello_drafted_prefix_or_draft_list(admin, fake, monkeypatch):
+def test_trello_drafted_needs_draft_list(admin, fake, monkeypatch):
     payload = {**CARD, "labels": [], "checklist": None}
+    # без личного списка черновиков в рабочий список команды ничего не кладём
+    aid = add_action(admin, "trello_card", payload, status="drafted")
+    assert base.run_queue(once=True)["failed"] == 1
+    row = action(admin, aid)
+    assert row["status"] == "failed" and "TRELLO_DRAFT_LIST_ID" in row["error"]
+    assert fake.writes("POST") == []
+    msg = outbox(admin)[-1]["text"]
+    assert msg.startswith("Не получилось:") and "черновик Trello не создан" in msg and "—" not in msg
+
+    monkeypatch.setenv("TRELLO_DRAFT_LIST_ID", "drafts-list")
+    fake.reset_calls()
     aid = add_action(admin, "trello_card", payload, status="drafted")
     base.run_queue(once=True)
     row = action(admin, aid)
     assert row["status"] == "drafted" and row["executed_at"] is not None
-    card = fake.writes("POST")[0][3]
-    assert card["name"] == "[черновик] Prepare SDK report" and card["idList"] == "list-1"
-
-    monkeypatch.setenv("TRELLO_DRAFT_LIST_ID", "drafts-list")
-    fake.reset_calls()
-    add_action(admin, "trello_card", payload, status="drafted")
-    base.run_queue(once=True)
     card = fake.writes("POST")[0][3]
     assert card["name"] == "Prepare SDK report" and card["idList"] == "drafts-list"
 
@@ -673,6 +731,34 @@ def test_newer_manual_change_in_db_beats_older_google_move(admin, plan_env):
     res = gcal.blocks()
     assert res["manual_moved"] == 0 and res["updated"] == 1
     assert base.parse_iso(fake.cals[PLAN][gcal.block_id(t1)]["start"]["dateTime"]) == at_today(20)
+
+
+def test_own_stale_patch_is_not_taken_for_manual_move(admin, plan_env, tmp_path):
+    """Гонка: наш PATCH прочитан позже, чем задачу успели снова сдвинуть, и отметка сверки
+    не встала. По updated нашей записи он узнаётся и ручным переносом не считается."""
+    fake = plan_env
+    t1 = add_task(admin, "Отчёт", at_today(10))
+    gcal.blocks()
+    b1 = gcal.block_id(t1)
+    admin.execute("UPDATE work.tasks SET planned_start = %s, planned_end = %s, planned_at = now() WHERE id = %s",
+                  (at_today(11), at_today(12), t1))
+    assert gcal.blocks()["updated"] == 1
+    patched = fake.cals[PLAN][b1]["updated"]
+    state = json.loads((tmp_path / "gcal_state.json").read_text())
+    assert state["plan"][PLAN]["own"][b1] == patched
+    # пока шёл PATCH, расстановщик сдвинул задачу на 14:00, а сверка осталась старой
+    admin.execute("UPDATE work.tasks SET planned_start = %s, planned_end = %s, planned_at = now(), "
+                  "block_synced_at = now() - interval '1 hour' WHERE id = %s", (at_today(14), at_today(15), t1))
+    res = gcal.blocks()
+    assert res["manual_moved"] == 0 and res["updated"] == 1
+    r = task(admin, t1)
+    assert r["planned_start"] == at_today(14) and r["planned_by"] == "auto"
+    assert base.parse_iso(fake.cals[PLAN][b1]["start"]["dateTime"]) == at_today(14)
+    # настоящий перенос руками после нашей записи по-прежнему принимается
+    fake.manual(PLAN, b1, start={"dateTime": at_today(18).isoformat()}, end={"dateTime": at_today(19).isoformat()})
+    res = gcal.blocks()
+    assert res["manual_moved"] == 1 and task(admin, t1)["planned_start"] == at_today(18)
+    assert b1 not in json.loads((tmp_path / "gcal_state.json").read_text())["plan"][PLAN]["own"]
 
 
 def test_calendar_run_reports_and_alerts(admin, plan_env, monkeypatch):

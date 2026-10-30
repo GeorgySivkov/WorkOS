@@ -137,7 +137,11 @@ def run(date: str | None = None, dry_run: bool = False, force: bool = False, **k
         if dry_run:
             return {"text": text, "meetings": meetings, "channels": channels, "dry_run": True}
         with conn.transaction():
-            conn.execute("INSERT INTO work.notices (key) VALUES (%s) ON CONFLICT DO NOTHING", (key,))
+            # параллельный прогон (таймер + ручной запуск) не шлёт отчёт дважды; --force шлёт всегда
+            fresh = conn.execute("INSERT INTO work.notices (key) VALUES (%s) ON CONFLICT DO NOTHING RETURNING key",
+                                 (key,)).fetchone()
+            if not fresh and not force:
+                return {"skipped": "already_sent", "key": key}
             conn.execute("INSERT INTO work.outbox (topic, text) VALUES ('system', %s)", (text,))
     return {"sent": True, "idle_meetings": len(meetings), "silent_channels": len(channels)}
 

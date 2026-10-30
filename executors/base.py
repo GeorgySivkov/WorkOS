@@ -7,6 +7,10 @@
 approved_hash равен хешу ТЕКУЩЕГО payload, посчитанному в SQL. Payload проверяется
 по строгой схеме своего типа; лишнее поле или не тот тип = failed с понятной ошибкой
 и сообщение в «Решения». plan_batch и task_add исполняет бот, сюда они не попадают.
+
+Внешний вызов идёт вне транзакции: сначала строка помечается executed_at и это
+коммитится, потом вызов, потом итог (см. claim / execute_action / sweep_interrupted).
+Так убитый посреди действия процесс не повторит его после перезапуска.
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ from typing import Any, Callable
 import httpx
 
 from core import db
+from core import timeutil as tu
 
 log = logging.getLogger("executors")
 
@@ -254,8 +259,7 @@ FOR UPDATE SKIP LOCKED
 
 
 def claim_one(conn, types=None) -> dict | None:
-    """Берёт одну строку очереди под блокировку. Звать внутри открытой транзакции:
-    блокировка держится, пока исполнитель работает и пишет статус."""
+    """Берёт одну строку очереди под блокировку (звать внутри транзакции)."""
     types = [t for t in (types or SCHEMAS) if t in SCHEMAS]
     if not types:
         return None
@@ -277,39 +281,111 @@ def _handler(action_type: str):
     return mod.execute
 
 
-def execute_action(conn, action: dict) -> dict:
-    """Проверить, исполнить, записать итог. conn в транзакции, строка заблокирована."""
-    notes: list[str] = []
-    try:
-        validate(action["type"], action["payload"])
-        result = _handler(action["type"])(action, notes.append) or {}
-    except Exception as e:  # noqa: BLE001  любая ошибка = failed и сообщение George
-        err = str(e) or type(e).__name__
-        if not isinstance(e, (SchemaError, ExecError)):
-            log.exception("action %s (%s) упало", action["id"], action["type"])
-        conn.execute("UPDATE work.actions SET status = 'failed', error = %s WHERE id = %s",
-                     (err[:2000], action["id"]))
-        what = TYPE_RU.get(action["type"], action["type"])
-        outbox(conn, "decisions", f"Не получилось: {esc(what)} (#{action['id']}). {esc(err[:600])}",
-               action["id"])
-        return {"id": action["id"], "status": "failed", "error": err}
-    status = "executed" if action["status"] == "approved" else "drafted"
-    conn.execute("UPDATE work.actions SET status = %s, executed_at = now(), error = NULL, result = %s "
-                 "WHERE id = %s", (status, db.jb(result), action["id"]))
-    for text in notes:
-        outbox(conn, "decisions", text, action["id"])
-    return {"id": action["id"], "status": status, "result": result}
+def _write_failed(conn, action: dict, err: str) -> dict:
+    conn.execute("UPDATE work.actions SET status = 'failed', error = %s WHERE id = %s",
+                 (err[:2000], action["id"]))
+    what = TYPE_RU.get(action["type"], action["type"])
+    outbox(conn, "decisions", f"Не получилось: {esc(what)} (#{action['id']}). {esc(err[:600])}", action["id"])
+    return {"id": action["id"], "status": "failed", "error": err}
 
 
-def process_one(types=None) -> dict | None:
-    """Одна строка очереди от блокировки до записи статуса в одной транзакции."""
+# ---------- исполнение в два шага ----------
+# Шаг 1 (короткая транзакция): взять строку, проверить схему, записать executed_at и
+# закоммитить. С этого момента очередь (executed_at IS NULL) строку больше не отдаёт.
+# Шаг 2: внешний вызов БЕЗ открытой транзакции. Шаг 3 (вторая транзакция): статус и
+# результат. Если процесс убили между шагами 1 и 3, строка остаётся approved/drafted
+# с executed_at и без result: повторять её нельзя (карточка или пост могли уже уйти),
+# поэтому sweep_interrupted() один раз сообщает George в «Систему» и помечает error.
+# Статусы меняются только approved|drafted -> executed|drafted|failed.
+
+def claim(types=None) -> tuple[dict | None, dict | None]:
+    """Шаг 1. Возвращает (действие, None) для исполнения или (действие, итог), если оно
+    уже закрыто без внешнего вызова (схема не сошлась). (None, None) = очередь пуста."""
     conn = db.connect()
     try:
         with conn.transaction():
             action = claim_one(conn, types)
             if action is None:
-                return None
-            return execute_action(conn, action)
+                return None, None
+            try:
+                validate(action["type"], action["payload"])
+            except SchemaError as e:
+                return action, _write_failed(conn, action, str(e))
+            conn.execute("UPDATE work.actions SET executed_at = now() WHERE id = %s AND executed_at IS NULL",
+                         (action["id"],))
+        return action, None
+    finally:
+        conn.close()
+
+
+def execute_action(action: dict) -> dict:
+    """Шаги 2 и 3: внешний вызов вне транзакции, затем итог отдельной транзакцией."""
+    notes: list[str] = []
+    err = None
+    result: dict = {}
+    try:
+        result = _handler(action["type"])(action, notes.append) or {}
+    except Exception as e:  # noqa: BLE001  любая ошибка = failed и сообщение George
+        err = str(e) or type(e).__name__
+        if not isinstance(e, (SchemaError, ExecError)):
+            log.exception("action %s (%s) упало", action["id"], action["type"])
+    conn = db.connect()
+    try:
+        with conn.transaction():
+            if err is not None:
+                return _write_failed(conn, action, err)
+            status = "executed" if action["status"] == "approved" else "drafted"
+            cur = conn.execute("UPDATE work.actions SET status = %s, executed_at = now(), error = NULL, "
+                               "result = %s WHERE id = %s AND status IN ('approved','drafted')",
+                               (status, db.jb(result), action["id"]))
+            if cur.rowcount != 1:
+                log.warning("action %s: статус успели поменять, итог %s не записан", action["id"], status)
+            for text in notes:
+                outbox(conn, "decisions", text, action["id"])
+            return {"id": action["id"], "status": status, "result": result}
+    finally:
+        conn.close()
+
+
+def process_one(types=None) -> dict | None:
+    """Одна строка очереди: взять (шаг 1), исполнить и записать итог (шаги 2-3)."""
+    action, done = claim(types)
+    if action is None:
+        return None
+    if done is not None:
+        return done
+    return execute_action(action)
+
+
+# ---------- прерванные действия ----------
+INTERRUPTED_AFTER_MIN = 15          # дольше любого внешнего вызова с повторами
+INTERRUPTED_ERROR = "исполнитель прервался посреди действия: результат неизвестен, повтора не будет"
+INTERRUPTED_SQL = """
+SELECT id, type, status, executed_at FROM work.actions
+WHERE status IN ('approved','drafted') AND executed_at IS NOT NULL
+  AND executed_at < now() - make_interval(mins => %(mins)s)
+  AND result IS NULL AND error IS NULL
+ORDER BY executed_at
+FOR UPDATE SKIP LOCKED
+"""
+
+
+def sweep_interrupted(minutes: int = INTERRUPTED_AFTER_MIN) -> int:
+    """Строки, взятые в работу и брошенные (SIGKILL, падение базы на шаге 3): один раз
+    сказать George в «Систему» и пометить error, чтобы не сказать второй раз."""
+    conn = db.connect()
+    try:
+        with conn.transaction():
+            rows = conn.execute(INTERRUPTED_SQL, {"mins": minutes}).fetchall()
+            for r in rows:
+                conn.execute("UPDATE work.actions SET error = %s WHERE id = %s", (INTERRUPTED_ERROR, r["id"]))
+                what = TYPE_RU.get(r["type"], r["type"])
+                when = tu.local(r["executed_at"]).strftime("%d.%m %H:%M")
+                outbox(conn, "system",
+                       f"Исполнитель прервался посреди действия #{r['id']} ({esc(what)}), начатого {when}. "
+                       "Не знаю, ушло ли оно наружу: проверь руками. Повторять сам не буду, "
+                       "чтобы не задвоить.", r["id"])
+        return len(rows)
     finally:
         conn.close()
 
@@ -338,12 +414,26 @@ def wait(seconds: float) -> bool:
     return _stop.wait(seconds)
 
 
+def _sweep_safely() -> None:
+    try:
+        n = sweep_interrupted()
+        if n:
+            log.warning("прерванных действий: %s, George предупреждён", n)
+    except Exception:  # noqa: BLE001  проверка вспомогательная, очередь важнее
+        log.exception("проверка прерванных действий упала")
+
+
 def run_queue(once: bool = False, types=None, sleep: float = 10) -> dict:
     """Разбирает очередь. once=True: до пустой очереди и выход (для таймера и тестов)."""
     counts = {"executed": 0, "drafted": 0, "failed": 0}
     if not once:
         install_signal_handlers()
+    _sweep_safely()
+    last_sweep = time.monotonic()
     while not _stop.is_set():
+        if time.monotonic() - last_sweep >= 60:
+            _sweep_safely()
+            last_sweep = time.monotonic()
         try:
             res = process_one(types)
         except Exception:  # noqa: BLE001  база недоступна и т.п.: подождать и снова

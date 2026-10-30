@@ -1,10 +1,12 @@
 """Коллектор Gmail (шаг 3.1): History API, historyId как водяная метка, тела целиком.
 
-Только gmail.readonly. Первый прогон (и откат, если historyId устарел и
-history.list ответил 404): messages.list q=newer_than:Nd, где N = max(lookback, 2),
-а historyId берётся из профиля ДО списка, чтобы не потерять письма,
-пришедшие между двумя запросами. Дальше history.list с startHistoryId,
-только messageAdded. Спам, корзина и черновики пропускаются.
+Только gmail.readonly. Первый прогон: messages.list q=newer_than:Nd, где
+N = max(lookback, 2). Откат, если historyId устарел и history.list ответил 404
+(например, после долгого простоя): q=after:<unix> от прошлого успешного прогона
+(метка минус lookback), чтобы не потерять почту за весь простой. historyId
+берётся из профиля ДО списка, чтобы не потерять письма, пришедшие между двумя
+запросами. Дальше history.list с startHistoryId, только messageAdded. Спам,
+корзина и черновики пропускаются. 429 и 403 rateLimitExceeded повторяются с паузой.
 
 Настройки источника (work.sources.config):
   {"refresh_env": "GMAIL_PERSONAL_REFRESH_TOKEN", "account": "personal"}
@@ -16,7 +18,8 @@ from __future__ import annotations
 import base64
 import html
 import re
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
 from html.parser import HTMLParser
 from typing import Iterable
@@ -29,6 +32,25 @@ from core import google, timeutil as tu
 UTC = timezone.utc
 API = "https://gmail.googleapis.com/gmail/v1/users/me"
 SKIP_LABELS = {"SPAM", "TRASH", "DRAFT"}
+
+
+RETRIES = 6
+RATE_REASONS = ("rateLimitExceeded", "userRateLimitExceeded")
+
+
+def _rate_limited(r: httpx.Response) -> bool:
+    if r.status_code in (429, 503):
+        return True
+    return r.status_code == 403 and any(x in r.text for x in RATE_REASONS)
+
+
+def _backoff(attempt: int, retry_after: str | None) -> float:
+    try:
+        if retry_after:
+            return min(float(retry_after), 60.0)
+    except ValueError:
+        pass
+    return float(min(2 ** attempt, 32))
 
 
 class GmailHistoryGone(Exception):
@@ -108,17 +130,24 @@ def _decode(raw: bytes, charset: str) -> str:
 class GmailCollector(Collector):
     kind = "gmail"
 
-    def __init__(self, source: dict, transport: httpx.BaseTransport | None = None):
+    def __init__(self, source: dict, transport: httpx.BaseTransport | None = None, sleep=time.sleep):
         super().__init__(source)
         self.cfg = source.get("config") or {}
         self.transport = transport
+        self.sleep = sleep
         sid = self.source_id
         self.account = self.cfg.get("account") or (sid.split(":", 1)[1] if ":" in sid else sid)
         self.refresh_env = self.cfg.get("refresh_env") or f"GMAIL_{self.account.upper()}_REFRESH_TOKEN"
         self.http: httpx.Client | None = None
 
     def _get(self, path: str, **params) -> dict:
-        r = self.http.get(API + path, params={k: v for k, v in params.items() if v is not None})
+        params = {k: v for k, v in params.items() if v is not None}
+        for attempt in range(RETRIES):
+            r = self.http.get(API + path, params=params)
+            if _rate_limited(r) and attempt < RETRIES - 1:
+                self.sleep(_backoff(attempt, r.headers.get("Retry-After")))
+                continue
+            break
         if r.status_code == 404:
             raise FileNotFoundError(path)
         if r.status_code >= 400:
@@ -126,12 +155,20 @@ class GmailCollector(Collector):
         return r.json()
 
     # ---------- какие письма читать ----------
+    def _query(self) -> str:
+        """Первый прогон: newer_than. Есть метка прошлого прогона: after от неё минус lookback."""
+        cur = self.state.get("cursor") if isinstance(self.state, dict) else None
+        if not cur:
+            return f"newer_than:{max(self.lookback.days, 2)}d"
+        since = self.since(default_days=max(self.lookback.days, 2)) - timedelta(days=1)
+        return f"after:{int(since.timestamp())}"
+
     def _initial_ids(self) -> tuple[list[str], str]:
         history_id = str(self._get("/profile")["historyId"])
-        days = max(self.lookback.days, 2)
+        q = self._query()
         ids, token = [], None
         while True:
-            body = self._get("/messages", q=f"newer_than:{days}d", maxResults=500, pageToken=token)
+            body = self._get("/messages", q=q, maxResults=500, pageToken=token)
             ids += [m["id"] for m in body.get("messages") or []]
             token = body.get("nextPageToken")
             if not token:

@@ -12,6 +12,7 @@ Telegram передоставит неподтверждённое, а захв�
 from __future__ import annotations
 
 import logging
+import re
 import signal
 import threading
 import time
@@ -20,7 +21,7 @@ from datetime import timedelta
 import httpx
 
 from core import config, timeutil as tu
-from core.tg import Bot, TgError, btn, esc
+from core.tg import Bot, TgError, btn, esc, scrub
 
 from bot import ask, candidates, capture, cards, domains, me, plancard, topics, voice
 from bot.topics import Ctx, short_date, web_app_button
@@ -28,6 +29,7 @@ from bot.topics import Ctx, short_date, web_app_button
 log = logging.getLogger("workos.bot")
 
 ALLOWED_UPDATES = ["message", "callback_query", "edited_message"]
+APPROVAL_PREFIXES = ("act", "pb", "rb")
 POLL_TIMEOUT = 50
 TICK_EVERY = 20
 OUTBOX_EVERY = 2
@@ -60,9 +62,22 @@ def outbox_batch() -> int:
 
 
 # ---------- периодическая работа (функции от ctx: в тестах и в фоновом потоке) ----------
-def _buttons(raw) -> list | None:
+# Чужие строки outbox (читатели, исполнитель, домены): только кнопки, которые они и
+# правда шлют. Кнопки одобрения (act:, pb:, rb:) рисует только сам бот, url-кнопок
+# нет ни у кого, web_app только на мини-приложение.
+FOREIGN_PREFIXES = ("idc", "tk")
+
+
+def foreign_prefixes() -> set[str]:
+    return set(FOREIGN_PREFIXES) | set(config.DOMAINS)
+
+
+def _buttons(raw, trusted: bool = True) -> list | None:
+    """Кнопки строки outbox в формат Telegram. trusted=False: строка не от бота, фильтр."""
     if not raw or not isinstance(raw, list):
         return None
+    allowed = foreign_prefixes()
+    app_url = config.env("APP_URL")
     rows = []
     for row in raw:
         if isinstance(row, dict):
@@ -72,15 +87,24 @@ def _buttons(raw) -> list | None:
             if not isinstance(b, dict) or not b.get("text"):
                 continue
             if b.get("callback_data") and len(str(b["callback_data"]).encode()) <= 64:
-                ok.append({"text": str(b["text"]), "callback_data": str(b["callback_data"])})
+                data = str(b["callback_data"])
+                if trusted or data.split(":", 1)[0] in allowed and ":" in data:
+                    ok.append({"text": str(b["text"]), "callback_data": data})
             elif b.get("url"):
-                ok.append({"text": str(b["text"]), "url": str(b["url"])})
+                if trusted:
+                    ok.append({"text": str(b["text"]), "url": str(b["url"])})
             elif b.get("web_app"):
                 wa = b["web_app"] if isinstance(b["web_app"], dict) else {"url": str(b["web_app"])}
-                ok.append({"text": str(b["text"]), "web_app": wa})
+                if trusted or (app_url and str(wa.get("url") or "") == app_url):
+                    ok.append({"text": str(b["text"]), "web_app": {"url": str(wa.get("url") or "")}})
         if ok:
             rows.append(ok)
     return rows or None
+
+
+def _backoff(ctx: Ctx, e: TgError) -> None:
+    s = re.search(r"retry after (\d+)", e.desc or "")
+    ctx.state["outbox_backoff"] = time.monotonic() + (int(s.group(1)) if s else 30)
 
 
 def flush_outbox(ctx: Ctx, now=None, limit: int | None = None) -> int:
@@ -91,23 +115,23 @@ def flush_outbox(ctx: Ctx, now=None, limit: int | None = None) -> int:
     if ctx.state.get("outbox_backoff", 0) > time.monotonic():
         return 0
     conn = ctx.conn
-    rows = conn.execute("""SELECT id, topic, text, buttons FROM work.outbox WHERE sent_at IS NULL
+    rows = conn.execute("""SELECT id, topic, text, buttons, (created_by = current_user) AS own
+                           FROM work.outbox WHERE sent_at IS NULL
                            ORDER BY created_at, id LIMIT %s""", (limit or outbox_batch(),)).fetchall()
     sent = 0
     for r in rows:
         try:
-            m = ctx.send(r["topic"], r["text"], buttons=_buttons(r["buttons"]))
+            m = ctx.send(r["topic"], r["text"], buttons=_buttons(r["buttons"], trusted=bool(r["own"])))
         except TgError as e:
             if e.code == 429:
-                import re
-                s = re.search(r"retry after (\d+)", e.desc or "")
-                ctx.state["outbox_backoff"] = time.monotonic() + (int(s.group(1)) if s else 30)
+                _backoff(ctx, e)
                 break
             if e.code == 400:
                 # кривое сообщение не должно застревать в очереди навсегда
-                log.warning("outbox %s не отправить: %s", r["id"], e.desc)
+                log.warning("outbox %s не отправить: %s", r["id"], scrub(e.desc))
                 conn.execute("UPDATE work.outbox SET sent_at = %s WHERE id = %s", (now, r["id"]))
-                ctx.notify_system(f"Сообщение outbox #{r['id']} отброшено: {esc(e.desc)}", key=f"ob400:{r['id']}")
+                ctx.notify_system(f"Сообщение outbox #{r['id']} отброшено: {esc(scrub(e.desc))}",
+                                  key=f"ob400:{r['id']}")
                 continue
             log.warning("outbox: %s", e)
             break
@@ -121,9 +145,14 @@ def flush_outbox(ctx: Ctx, now=None, limit: int | None = None) -> int:
 
 
 def reminders(ctx: Ctx, now=None) -> int:
-    """Задачи с наступившим remind_at -> «⏰ ...» в «План»; тихие часы ждут утра."""
+    """Задачи с наступившим remind_at -> «⏰ ...» в «План»; тихие часы ждут утра.
+
+    Одно кривое напоминание не держит очередь: 400 -> ещё раз без кнопки мини-приложения,
+    не вышло -> отмечаем отправленным и пишем в «Систему»; 429 -> пауза, как у outbox."""
     now = now or tu.now()
     if tu.is_quiet(now):
+        return 0
+    if ctx.state.get("outbox_backoff", 0) > time.monotonic():
         return 0
     conn = ctx.conn
     rows = conn.execute("""SELECT id, title, remind_at FROM work.tasks
@@ -134,17 +163,40 @@ def reminders(ctx: Ctx, now=None) -> int:
         text = f"⏰ {esc(r['title'])}"
         if now - r["remind_at"] > timedelta(minutes=30):
             text += f"\n<i>напоминание на {short_date(tu.local(r['remind_at']).date())} {tu.hm(r['remind_at'])}</i>"
-        rows_b = [[btn("Через час", f"tk:{r['id']}:1h"), btn("На завтра", f"tk:{r['id']}:tmr")]]
+        base_rows = [[btn("Через час", f"tk:{r['id']}:1h"), btn("На завтра", f"tk:{r['id']}:tmr")]]
         wa = web_app_button()
-        if wa:
-            rows_b.insert(0, [wa])
-        try:
-            ctx.send("plan", text, buttons=rows_b)
-        except (TgError, httpx.HTTPError) as e:
-            log.warning("напоминание %s: %s", r["id"], e)
+        attempts = [[[wa]] + base_rows, base_rows] if wa else [base_rows]
+        sent, stop, err = False, False, None
+        for rows_b in attempts:
+            try:
+                ctx.send("plan", text, buttons=rows_b)
+                sent = True
+                break
+            except TgError as e:
+                if e.code == 429:
+                    _backoff(ctx, e)
+                    stop = True
+                    break
+                if e.code == 400:
+                    err = e
+                    continue                      # ещё раз без кнопки мини-приложения
+                log.warning("напоминание %s: %s", r["id"], scrub(e))
+                stop = True
+                break
+            except httpx.HTTPError as e:
+                log.warning("напоминание %s: сеть: %s", r["id"], scrub(e))
+                stop = True
+                break
+        if stop:
             break
         conn.execute("UPDATE work.tasks SET reminded_at = %s WHERE id = %s AND reminded_at IS NULL", (now, r["id"]))
-        n += 1
+        if sent:
+            n += 1
+        else:
+            desc = scrub(err.desc if err else "?")
+            log.warning("напоминание %s не отправить: %s", r["id"], desc)
+            ctx.notify_system(f"Напоминание «{esc(r['title'])}» не ушло, отметил отправленным: {esc(desc)}",
+                              key=f"rm400:{r['id']}")
     return n
 
 
@@ -156,7 +208,7 @@ def on_task_button(ctx: Ctx, cq: dict, parts: list[str]) -> str | None:
         tid, op = int(parts[1]), parts[2]
     except (IndexError, ValueError):
         return "Не понял кнопку"
-    row = conn.execute("""SELECT id, title, remind_at FROM work.tasks
+    row = conn.execute("""SELECT id, title, due, remind_at FROM work.tasks
                           WHERE id = %s AND done_at IS NULL AND dropped_at IS NULL""", (tid,)).fetchone()
     if not row:
         return "Задача уже закрыта"
@@ -166,7 +218,7 @@ def on_task_button(ctx: Ctx, cq: dict, parts: list[str]) -> str | None:
         note = f"напомню в {tu.hm(new)}"
     elif op == "tmr":
         d = tu.logical_today() + timedelta(days=1)
-        new = tu.at_local(d, tu.local(row["remind_at"]).time()) if row["remind_at"] else None
+        new = shift_remind(row["remind_at"], row["due"], d)
         conn.execute("""UPDATE work.tasks SET due = %s, remind_at = %s, reminded_at = NULL,
                                planned_start = NULL, planned_end = NULL, planned_by = NULL, planned_at = now()
                         WHERE id = %s""", (d, new, tid))
@@ -180,6 +232,23 @@ def on_task_button(ctx: Ctx, cq: dict, parts: list[str]) -> str | None:
         wa = web_app_button()
         ctx.edit(msg_id, f"⏰ {esc(row['title'])} · {note}", [[wa]] if wa else [])
     return note
+
+
+def shift_remind(remind_at, old_due, new_due):
+    """«На завтра»: напоминание едет вместе со сроком на столько же дней.
+
+    Время 00:00-03:59 относится к следующей календарной дате после логического дня,
+    поэтому дату не пересобираем из new_due, а сдвигаем на (new_due - old_due)."""
+    if not remind_at:
+        return None
+    loc = tu.local(remind_at)
+    base = old_due or tu.logical_date(remind_at)
+    t = loc.time().replace(tzinfo=None)
+    new = tu.at_local(loc.date() + timedelta(days=(new_due - base).days), t)
+    if new <= tu.now():
+        # срок был впереди напоминания: ставим то же время в новый логический день
+        new = tu.at_local(new_due + timedelta(days=1) if t.hour < config.LOGICAL_DAY_END_HOUR else new_due, t)
+    return new
 
 
 def health_ping() -> None:
@@ -253,7 +322,7 @@ class Terminal:
                 self.on_edited(u["edited_message"])
         except Exception as e:
             log.exception("апдейт %s", u.get("update_id"))
-            self.ctx.notify_system(f"Ошибка обработки: {esc(type(e).__name__)}: {esc(str(e)[:200])}",
+            self.ctx.notify_system(f"Ошибка обработки: {esc(type(e).__name__)}: {esc(scrub(e)[:200])}",
                                    key=f"err:{type(e).__name__}")
 
     def on_message(self, msg: dict) -> None:
@@ -322,7 +391,9 @@ class Terminal:
         }
         answer = None
         try:
-            if prefix in handlers:
+            if prefix in APPROVAL_PREFIXES and not self._from_card(cq, parts):
+                answer = "Кнопка не с карточки бота"
+            elif prefix in handlers:
                 answer = handlers[prefix](ctx, cq, parts)
             elif domains.is_domain(prefix):
                 answer = domains.on_callback(ctx, cq, prefix)
@@ -333,6 +404,15 @@ class Terminal:
             raise
         finally:
             ctx.bot.answer(cq.get("id"), answer)
+
+    def _from_card(self, cq: dict, parts: list[str]) -> bool:
+        """act:/pb:/rb: принимаются только с сообщения, чья строка outbox создана ботом
+        и ссылается на то же действие (подделанную строку outbox бот не признает)."""
+        try:
+            aid = int(parts[1])
+        except (IndexError, ValueError):
+            return False
+        return cards.is_card(self.ctx.conn, aid, (cq.get("message") or {}).get("message_id"))
 
     # --- периодика ---
     def _due(self, name: str, every: float, force: bool) -> bool:
@@ -347,7 +427,7 @@ class Terminal:
             return fn(*a)
         except Exception as e:
             log.exception("периодика %s", name)
-            ctx.notify_system(f"Сбой в фоне ({name}): {esc(type(e).__name__)}: {esc(str(e)[:200])}",
+            ctx.notify_system(f"Сбой в фоне ({name}): {esc(type(e).__name__)}: {esc(scrub(e)[:200])}",
                               key=f"bg:{name}")
             return None
 

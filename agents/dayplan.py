@@ -6,8 +6,13 @@ run() каждые 15 минут: если поверх автоматическ
 сообщение. Не влезло до конца дня: время снимается, бот спрашивает, переносить ли
 на завтра (кнопки tk:<id>:tmr / tk:<id>:keep). Ручные блоки не трогаются.
 
-classify_tasks() каждые 5 минут: задачам из мини-приложения и захвата без клетки
-дешёвая модель (задача 'classify_cell') подбирает клетку сетки и размер.
+Ручное время (agents.scheduler.fixed_slot): блок planned_by='manual' или «в 10» из текста
+задачи (remind_at в этот день без блока). Оно занято для сдвигов и само не двигается.
+
+classify_tasks() каждые 5 минут: задачам без клетки (из мини-приложения, захвата, плана
+и обещаний) дешёвая модель (задача 'classify_cell') подбирает клетку сетки и размер.
+Модель не ответила: попытка засчитывается задачам пачки, повтор не раньше чем через час,
+после трёх неудач задача остаётся без клетки; в «Систему» одно сообщение в день.
 """
 from __future__ import annotations
 
@@ -18,6 +23,9 @@ from core import config, db, llm, timeutil as tu
 from core.tg import btn, esc
 
 CLASSIFY_BATCH = 20
+CLASSIFY_SOURCES = ("app", "capture", "plan", "commitment")
+CLASSIFY_MAX_TRIES = 3
+CLASSIFY_RETRY_AFTER = "1 hour"
 
 
 def scheduler():
@@ -35,11 +43,20 @@ def run(date: str | None = None, dry_run: bool = False, now: datetime | None = N
     buf = timedelta(minutes=config.BUFFER_MINUTES)
     sched = scheduler()
     with db.connect() as conn:
-        tasks = conn.execute(
-            """SELECT id, title, size, planned_by, planned_start, planned_end FROM work.tasks
-               WHERE done_at IS NULL AND dropped_at IS NULL AND planned_start IS NOT NULL
-                 AND planned_end IS NOT NULL AND planned_start < %s AND planned_end > %s
-               ORDER BY planned_start, id""", (d1, d0)).fetchall()
+        rows = conn.execute(
+            """SELECT id, title, size, due, remind_at, planned_by, planned_start, planned_end FROM work.tasks
+               WHERE done_at IS NULL AND dropped_at IS NULL
+                 AND ((planned_start IS NOT NULL AND planned_end IS NOT NULL
+                       AND planned_start < %(d1)s AND planned_end > %(d0)s)
+                      OR (planned_start IS NULL AND remind_at >= %(d0)s AND remind_at < %(d1)s))
+               ORDER BY COALESCE(planned_start, remind_at), id""", {"d0": d0, "d1": d1}).fetchall()
+        tasks = []
+        for r in rows:
+            fx = sched.fixed_slot(r, day)
+            if fx:                                       # время назвал George: занято и не двигается
+                tasks.append({**r, "planned_by": "manual", "planned_start": fx[0], "planned_end": fx[1]})
+            elif r["planned_by"] == "auto" and r["planned_start"] is not None:
+                tasks.append(r)
         meets = conn.execute(
             """SELECT title, starts_at, ends_at FROM work.calendar_feed
                WHERE status <> 'cancelled' AND busy AND NOT all_day AND starts_at < %s AND ends_at > %s
@@ -123,18 +140,25 @@ def classify_tasks(date: str | None = None, dry_run: bool = False, limit: int = 
         if not cells:
             return {"skipped": "сетки нет"}
         tasks = conn.execute(
-            """SELECT t.id, t.title, t.context_id, t.size FROM work.tasks t
-               WHERE t.source IN ('app','capture') AND t.cell_id IS NULL AND t.dropped_at IS NULL
+            f"""SELECT t.id, t.title, t.context_id, t.size FROM work.tasks t
+               WHERE t.source = ANY(%(src)s) AND t.cell_id IS NULL AND t.dropped_at IS NULL
                  AND t.created_at > now() - interval '7 days'
                  AND NOT EXISTS (SELECT 1 FROM work.notices n WHERE n.key = 'cls:' || t.id)
-               ORDER BY t.id LIMIT %s""", (limit,)).fetchall()
+                 AND NOT EXISTS (SELECT 1 FROM work.notices f WHERE f.key LIKE 'clsfail:' || t.id || ':%%'
+                                 AND f.sent_at > now() - interval '{CLASSIFY_RETRY_AFTER}')
+               ORDER BY t.id LIMIT %(n)s""", {"src": list(CLASSIFY_SOURCES), "n": limit}).fetchall()
         if not tasks:
             return {"classified": 0}
         grid = "\n".join(f"{c['id']} {c['title']}" + (f" ({c['kind']}, {c['attr']})" if c["attr"] else
                                                      f" ({c['kind']})") for c in cells)
         user = ("Клетки:\n" + grid + "\n\nЗадачи:\n"
                 + "\n".join(f"{t['id']}: {t['title']} [{t['context_id'] or 'personal'}]" for t in tasks))
-        ans = llm.complete_json("classify_cell", CLASSIFY_SYSTEM, user)
+        try:                                             # одна попытка модели на пачку
+            ans = llm.complete_json("classify_cell", CLASSIFY_SYSTEM, user)
+        except Exception as e:  # noqa: BLE001 — модель недоступна или ответ не JSON
+            if dry_run:
+                raise
+            return classify_failed(conn, tasks, e)
         ans = ans if isinstance(ans, dict) else {}
         valid = {c["id"] for c in cells}
         changes = {}
@@ -161,6 +185,29 @@ def classify_tasks(date: str | None = None, dry_run: bool = False, limit: int = 
                 # отметка «уже спрашивали»: задачу без подходящей клетки модель не видит повторно
                 conn.execute("INSERT INTO work.notices (key) VALUES (%s) ON CONFLICT DO NOTHING", (f"cls:{t['id']}",))
     return {"classified": n, "seen": len(tasks)}
+
+
+def classify_failed(conn, tasks: list[dict], err: Exception) -> dict:
+    """Неудача модели: отметка попытки каждой задаче пачки (clsfail:<id>:<n>); на третьей
+    задача получает cls:<id> и больше не спрашивается. В «Систему» одно сообщение в день."""
+    gave_up = 0
+    with conn.transaction():
+        for t in tasks:
+            n = conn.execute("SELECT count(*) AS n FROM work.notices WHERE key LIKE %s",
+                             (f"clsfail:{t['id']}:%",)).fetchone()["n"] + 1
+            conn.execute("INSERT INTO work.notices (key) VALUES (%s) ON CONFLICT DO NOTHING",
+                         (f"clsfail:{t['id']}:{n}",))
+            if n >= CLASSIFY_MAX_TRIES:
+                conn.execute("INSERT INTO work.notices (key) VALUES (%s) ON CONFLICT DO NOTHING", (f"cls:{t['id']}",))
+                gave_up += 1
+        key = f"clsfail-notice:{tu.logical_today().isoformat()}"
+        if conn.execute("INSERT INTO work.notices (key) VALUES (%s) ON CONFLICT DO NOTHING RETURNING key",
+                        (key,)).fetchone():
+            conn.execute(
+                "INSERT INTO work.outbox (topic, text) VALUES ('system', %s)",
+                (f"⚠ Не разложил задачи по клеткам: модель не ответила ({esc(str(err)[:200])}). "
+                 f"Повторю через час, после {CLASSIFY_MAX_TRIES} неудач задача останется без клетки.",))
+    return {"failed": str(err)[:200], "seen": len(tasks), "gave_up": gave_up}
 
 
 if __name__ == "__main__":

@@ -299,7 +299,7 @@
         h('span', { class: 'who' }, h('span', { 'aria-hidden': 'true' }, '◆ '), 'Георгий', h('span', { 'aria-hidden': 'true' }, ' ◆')),
         h('span', { class: 'head' }, 'Уровень повышен'), h('span', { class: 'lv' }, from + ' → ' + to),
         h('span', { class: 'note' }, 'Сундук и награды ждут в «Персонаже»')));
-    ov.addEventListener('click', () => ov.remove());
+    // оверлей не ловит нажатия (pointer-events: none): под ним можно дальше отмечать
     app.append(ov);
     setTimeout(() => ov.remove(), 2900);
   }
@@ -621,7 +621,8 @@
         announce('Ритуал отмечен: ' + hb.title + ', +' + r.xp + ' опыта');
         S.fxUntil = Date.now() + 1400;
       }
-      if (!was && !r.done) toast('Потолок на сегодня: по этой характеристике уже 100 опыта');
+      if (r.locked) toast('Уже отмечено задачей или из Garmin, здесь не снимается');
+      else if (!was && r.done && !(r.xp > 0)) toast('Отмечено. Опыта сегодня больше не будет: по этой характеристике уже 100');
       if (r.level_up) levelUp(before.level, r.character.level);
       scheduleRefresh();
     } catch (e) {
