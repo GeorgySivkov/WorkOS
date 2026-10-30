@@ -1,0 +1,20 @@
+[Unit]
+Description=WorkOS: workctl %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=workos-reader
+Group=workos-reader
+WorkingDirectory=/opt/workos
+Environment=WORKOS_ROLE=reader
+Environment=HOME=/var/lib/workos-reader
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/workos/.venv/bin/python workctl.py %i
+TimeoutStartSec=20min
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/workos-reader /tmp
+PrivateTmp=true

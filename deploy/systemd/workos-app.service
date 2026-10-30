@@ -1,0 +1,24 @@
+[Unit]
+Description=WorkOS: мини-приложение (127.0.0.1:8787, наружу через Tailscale Funnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=workos-app
+Group=workos-app
+WorkingDirectory=/opt/workos
+Environment=WORKOS_ROLE=app
+Environment=HOME=/var/lib/workos-app
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/workos/.venv/bin/python -m app.server
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/workos-app /tmp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

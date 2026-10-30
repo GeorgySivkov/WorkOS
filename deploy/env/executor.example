@@ -1,0 +1,20 @@
+# /opt/workos/.env.executor  (workos-exec, 600). Право записи наружу. Модели нет.
+PGHOST=<host>-do-user-....db.ondigitalocean.com
+PGPORT=25060
+PGDATABASE=defaultdb
+PGSSLMODE=require
+PGUSER=workos_exec
+PGPASSWORD=
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_WRITE_REFRESH_TOKEN=
+GCAL_MIRROR_MAP={"infatica":"<id>@group.calendar.google.com","alfa":"<id>@group.calendar.google.com"}
+GCAL_PLAN_CALENDAR=<id>@group.calendar.google.com
+EXEC_STATE_DIR=/var/lib/workos-exec
+# --- фаза 5 ---
+TRELLO_KEY=
+TRELLO_WRITE_TOKEN=
+# TRELLO_DRAFT_LIST_ID=
+SLACK_WRITE_TOKEN=
+# GMAIL_WRITE_TOKENS={"personal":"GOOGLE_WRITE_REFRESH_TOKEN"}
+# MANUAL_DRAFT_ACCOUNTS=alfa,eas:alfa

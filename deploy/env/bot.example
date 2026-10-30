@@ -1,0 +1,18 @@
+# /opt/workos/.env.bot  (workos-bot, 600). Ни одного токена, которым можно что-то сделать снаружи.
+PGHOST=<host>-do-user-....db.ondigitalocean.com
+PGPORT=25060
+PGDATABASE=defaultdb
+PGSSLMODE=require
+PGUSER=workos_bot
+PGPASSWORD=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_OWNER_ID=
+APP_URL=https://<droplet>.<tailnet>.ts.net/
+CLAUDE_CODE_OAUTH_TOKEN=
+# CLAUDE_BIN=/usr/bin/claude
+HEALTHCHECKS_URL=https://hc-ping.com/<uuid>
+WHISPER_BIN=/opt/whisper.cpp/build/bin/whisper-cli
+WHISPER_MODEL=/opt/whisper.cpp/models/ggml-base-q5_1.bin
+# поиск «Спросить»: векторная часть грузит модель ~400 МБ; на дроплете 1 ГБ держи 0
+WORKOS_ASK_VECTOR=0
+WORKOS_SELF_NAMES=Георгий,Жора,Гоша,George

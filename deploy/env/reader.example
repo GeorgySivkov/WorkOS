@@ -1,0 +1,38 @@
+# /opt/workos/.env.reader  (workos-reader, 600). Только read-only токены источников.
+PGHOST=<host>-do-user-....db.ondigitalocean.com
+PGPORT=25060
+PGDATABASE=defaultdb
+PGSSLMODE=require
+PGUSER=workos_reader
+PGPASSWORD=
+CLAUDE_CODE_OAUTH_TOKEN=
+# кто такой «я»: свои адреса и id не заводятся людьми и не триажатся
+WORKOS_SELF_EMAILS=esivkove@gmail.com
+WORKOS_SELF_HANDLES=
+WORKOS_SELF_NAMES=Георгий,Жора,Гоша,George
+# --- фаза 2 ---
+TRELLO_KEY=
+TRELLO_TOKEN=
+PLAUD_TOKEN=
+# PLAUD_API_BASE=https://api.plaud.ai
+ICAL_PERSONAL_URL=
+ICAL_INFATICA_URL=
+SLACK_TOKEN=
+ALFA_EAS_HOST=owa.alfabank.ru
+ALFA_EAS_USER=MOSCOW\U_M2PH5
+ALFA_EAS_PASSWORD=
+ALFA_EAS_DEVICE_ID=
+ALFA_CA_FILE=/opt/workos/certs/russian_trusted_root_ca.pem
+# --- фаза 3 ---
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GMAIL_PERSONAL_REFRESH_TOKEN=
+EMBED_MODEL_DIR=/opt/workos/models/multilingual-e5-base
+EMBED_THREADS=1
+# --- персонаж ---
+GARMIN_TOKENS=/var/lib/workos-reader/.garminconnect
+# --- фаза 5 ---
+# TRELLO_PROPOSE_LIST_ID=
+# --- фаза 7 ---
+INGEST_TOKEN=
+INGEST_BIND=<tailnet-ip дроплета>:8788

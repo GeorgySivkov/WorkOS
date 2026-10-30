@@ -1,0 +1,11 @@
+# /opt/workos/.env.app  (workos-app, 600). Видит только дела и персонажа.
+PGHOST=<host>-do-user-....db.ondigitalocean.com
+PGPORT=25060
+PGDATABASE=defaultdb
+PGSSLMODE=require
+PGUSER=workos_app
+PGPASSWORD=
+TELEGRAM_BOT_ID=
+TELEGRAM_OWNER_ID=
+APP_PORT=8787
+# APP_DEV_TOKEN=   # только для просмотра в браузере, на проде пусто

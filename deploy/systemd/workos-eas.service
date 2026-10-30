@@ -1,0 +1,24 @@
+[Unit]
+Description=WorkOS: почта и календарь Альфы (ActiveSync, Ping)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=workos-reader
+Group=workos-reader
+WorkingDirectory=/opt/workos
+Environment=WORKOS_ROLE=reader
+Environment=HOME=/var/lib/workos-reader
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/workos/.venv/bin/python -m collectors.eas --watch
+Restart=always
+RestartSec=10
+RestartPreventExitStatus=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/workos-reader /tmp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

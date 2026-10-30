@@ -1,0 +1,11 @@
+# WorkOS на дроплете: .venv/bin/pip install -r requirements.txt
+psycopg[binary]>=3.2
+httpx>=0.27
+python-dotenv>=1.0
+cryptography>=42        # проверка подписи Telegram в мини-приложении (Ed25519)
+icalendar>=5.0
+recurring-ical-events>=2.2
+# эмбеддинги (фаза 3): multilingual-e5-base в ONNX int8
+onnxruntime>=1.17
+tokenizers>=0.15
+numpy>=1.26

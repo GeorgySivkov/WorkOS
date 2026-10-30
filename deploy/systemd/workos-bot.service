@@ -1,0 +1,24 @@
+[Unit]
+Description=WorkOS: бот-терминал
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=workos-bot
+Group=workos-bot
+WorkingDirectory=/opt/workos
+Environment=WORKOS_ROLE=bot
+Environment=HOME=/var/lib/workos-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/workos/.venv/bin/python -m bot.terminal
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/workos-bot /tmp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

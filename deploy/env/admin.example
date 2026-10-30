@@ -1,0 +1,14 @@
+# /opt/workos/.env.admin  (root, 600): только для migrate.py, seed-grid и бэкапа
+PGHOST=<host>-do-user-....db.ondigitalocean.com
+PGPORT=25060
+PGDATABASE=defaultdb
+PGSSLMODE=require
+PGUSER=doadmin
+PGPASSWORD=
+# пароли ролей: задаются один раз при создании (openssl rand -base64 24)
+WORKOS_BOT_PASSWORD=
+WORKOS_APP_PASSWORD=
+# reader и exec уже заведены в шаге 0.3, их пароли здесь не нужны
+# бэкап: публичный ключ age (age-keygen), приватный храни НЕ на дроплете
+BACKUP_AGE_RECIPIENT=age1...
+BACKUP_DIR=/var/backups/workos

@@ -1,0 +1,8 @@
+[Unit]
+Description=WorkOS: шифрованный бэкап базы (pg_dump | age)
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/workos
+ExecStart=/bin/bash /opt/workos/deploy/backup.sh
