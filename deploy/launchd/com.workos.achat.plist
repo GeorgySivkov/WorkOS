@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent коллектора А-Чата (шаг 7.2): раз в 10 минут, пока Мак не спит.
+  launchd не раскрывает ~ и $HOME, поэтому __HOME__ заменяется при установке:
+    sed "s#__HOME__#$HOME#g" deploy/launchd/com.workos.achat.plist > ~/Library/LaunchAgents/com.workos.achat.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.workos.achat.plist
+  Скрипт ожидается в __HOME__/.workos/achat_collector.py (скопировать из mac/).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.workos.achat</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__HOME__/.workos/achat_collector.py</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/workos-achat.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/workos-achat.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONIOENCODING</key>
+    <string>utf-8</string>
+  </dict>
+</dict>
+</plist>
