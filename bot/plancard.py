@@ -269,6 +269,21 @@ def insert_tasks(conn, row: dict, selected: list[int] | None) -> list[int]:
         start = cards._ts(it.get("start")) if not is_week else None
         end = cards._ts(it.get("end")) if start else None
         ctx_id = it.get("context_id") if it.get("context_id") in cx else None
+        tid = it.get("task_id")
+        if tid:
+            # задача уже есть (перенос, просрочка): двигаем её, а не заводим дубль;
+            # время, поставленное руками, не трогаем
+            ex = conn.execute("""UPDATE work.tasks SET due = %s, week_of = %s,
+                                   planned_start = CASE WHEN planned_by = 'manual' THEN planned_start ELSE %s END,
+                                   planned_end   = CASE WHEN planned_by = 'manual' THEN planned_end ELSE %s END,
+                                   planned_by    = CASE WHEN planned_by = 'manual' THEN planned_by ELSE %s END,
+                                   planned_at    = now()
+                                 WHERE id = %s AND done_at IS NULL AND dropped_at IS NULL RETURNING id""",
+                              (None if is_week else d, monday if is_week else None, start, end,
+                               "auto" if start else None, int(tid))).fetchone()
+            if ex:
+                ids.append(ex["id"])
+                continue
         ids.append(conn.execute(
             """INSERT INTO work.tasks (context_id, title, due, week_of, size, cell_id, source, action_id,
                                        planned_start, planned_end, planned_at, planned_by)

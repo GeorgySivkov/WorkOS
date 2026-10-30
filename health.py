@@ -22,7 +22,7 @@ from core.tg import esc
 
 log = logging.getLogger("workos.health")
 
-THRESHOLD_HOURS = {"achat": 6.0, "eas": 1.0}
+THRESHOLD_HOURS = {"achat": 26.0, "eas": 1.0}   # Мак спит ночью: сутки без А-Чата не тревога
 DEFAULT_HOURS = 1.0
 STALE_OUTBOX_MIN = 30
 

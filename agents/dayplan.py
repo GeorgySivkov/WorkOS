@@ -4,7 +4,7 @@ run() каждые 15 минут: если поверх автоматическ
 (зеркало видит её в течение 15 минут) или ручной блок, задача сдвигается в следующее
 свободное окно с текущей минуты (agents.scheduler.place), а в «План» уходит короткое
 сообщение. Не влезло до конца дня: время снимается, бот спрашивает, переносить ли
-на завтра (кнопки tsk:<id>:tomorrow / tsk:<id>:keep). Ручные блоки не трогаются.
+на завтра (кнопки tk:<id>:tmr / tk:<id>:keep). Ручные блоки не трогаются.
 
 classify_tasks() каждые 5 минут: задачам из мини-приложения и захвата без клетки
 дешёвая модель (задача 'classify_cell') подбирает клетку сетки и размер.
@@ -97,7 +97,7 @@ def run(date: str | None = None, dry_run: bool = False, now: datetime | None = N
                 conn.execute(
                     "INSERT INTO work.outbox (topic, text, buttons) VALUES ('plan', %s, %s)",
                     (f"Не влезло: {esc(t['title'])} ({conflicts[t['id']]}). Перенести на завтра?",
-                     db.jb([[btn("На завтра", f"tsk:{t['id']}:tomorrow"), btn("Оставить", f"tsk:{t['id']}:keep")]])))
+                     db.jb([[btn("На завтра", f"tk:{t['id']}:tmr"), btn("Оставить", f"tk:{t['id']}:keep")]])))
     return {"day": day.isoformat(), "checked": len(tasks), "moved": len(moved), "unplaced": len(unplaced)}
 
 

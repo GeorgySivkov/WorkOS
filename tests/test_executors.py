@@ -384,11 +384,19 @@ def test_gmail_always_creates_draft(admin, fake, status, final):
 
 def test_gmail_unknown_account_fails(admin, fake, monkeypatch):
     monkeypatch.setenv("GMAIL_WRITE_TOKENS", json.dumps({"infatica": "GMAIL_INFATICA_WRITE_REFRESH_TOKEN"}))
-    aid = add_action(admin, "email_reply", {"account": "alfa", "to": ["a@b.c"], "cc": [], "subject": "s",
+    aid = add_action(admin, "email_reply", {"account": "otherbox", "to": ["a@b.c"], "cc": [], "subject": "s",
                                             "body": "b"})
     base.run_queue(once=True)
     row = action(admin, aid)
-    assert row["status"] == "failed" and "alfa" in row["error"]
+    assert row["status"] == "failed" and "otherbox" in row["error"]
+    # Альфа (Exchange по EAS): черновик текстом в «Решения», Gmail не трогается
+    aid2 = add_action(admin, "email_reply", {"account": "alfa", "to": ["a@b.c"], "cc": [], "subject": "Тема",
+                                             "body": "Текст ответа"})
+    base.run_queue(once=True)
+    row2 = action(admin, aid2)
+    assert row2["status"] == "executed" and row2["result"]["manual"] is True
+    note = admin.execute("SELECT text FROM work.outbox WHERE ref_action = %s", (aid2,)).fetchone()
+    assert "Текст ответа" in note["text"]
     from executors import gmail
     assert gmail.token_env("gmail:infatica") == "GMAIL_INFATICA_WRITE_REFRESH_TOKEN"
     assert gmail.token_env("personal") == "GOOGLE_WRITE_REFRESH_TOKEN"

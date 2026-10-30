@@ -11,7 +11,7 @@
   message: channel, channel_name, channel_type (im|mpim|channel), ts (или external_id
            «канал:ts»), thread_ts, is_reply, user, is_dm, mention / mentions_me, from_me
 Своё («от меня») определяется по meta.from_me/is_me/outgoing, адресам из
-WORKOS_ME_EMAILS, Slack id из WORKOS_ME_SLACK_IDS или WORKOS_ME_PERSON_ID.
+WORKOS_SELF_EMAILS, Slack id из WORKOS_SELF_HANDLES или WORKOS_ME_PERSON_ID.
 """
 from __future__ import annotations
 
@@ -45,11 +45,12 @@ def _env_set(name: str) -> set[str]:
 
 
 def me_emails() -> set[str]:
-    return _env_set("WORKOS_ME_EMAILS")
+    # одно имя на всю систему: WORKOS_SELF_EMAILS (WORKOS_ME_EMAILS понимается для совместимости)
+    return _env_set("WORKOS_SELF_EMAILS") | _env_set("WORKOS_ME_EMAILS")
 
 
 def me_slack_ids() -> set[str]:
-    return _env_set("WORKOS_ME_SLACK_IDS")
+    return _env_set("WORKOS_SELF_HANDLES") | _env_set("WORKOS_ME_SLACK_IDS")
 
 
 def addr(x) -> tuple[str, str]:

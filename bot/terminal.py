@@ -149,7 +149,8 @@ def reminders(ctx: Ctx, now=None) -> int:
 
 
 def on_task_button(ctx: Ctx, cq: dict, parts: list[str]) -> str | None:
-    """tk:<task_id>:1h|tmr — кнопки напоминания (отметку «сделано» ставит мини-приложение)."""
+    """tk:<task_id>:1h|tmr|keep — кнопки напоминания и «не влезло» из живого дня
+    (отметку «сделано» ставит мини-приложение)."""
     conn = ctx.conn
     try:
         tid, op = int(parts[1]), parts[2]
@@ -170,6 +171,8 @@ def on_task_button(ctx: Ctx, cq: dict, parts: list[str]) -> str | None:
                                planned_start = NULL, planned_end = NULL, planned_by = NULL, planned_at = now()
                         WHERE id = %s""", (d, new, tid))
         note = f"перенёс на {short_date(d)}" + (f" {tu.hm(new)}" if new else "")
+    elif op == "keep":
+        note = "оставил в списке на сегодня без времени"
     else:
         return "Не понял кнопку"
     msg_id = (cq.get("message") or {}).get("message_id")

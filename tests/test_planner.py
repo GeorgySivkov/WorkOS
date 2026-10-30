@@ -188,7 +188,7 @@ def test_dayplan_unplaced_asks_with_buttons(admin, role_env):
     assert t["planned_start"] is None and t["planned_end"] is None
     m = admin.execute("SELECT text, buttons FROM work.outbox").fetchone()
     assert m["text"].startswith("Не влезло: Ревью") and m["text"].endswith("Перенести на завтра?")
-    assert [b["callback_data"] for b in m["buttons"][0]] == [f"tsk:{tid}:tomorrow", f"tsk:{tid}:keep"]
+    assert [b["callback_data"] for b in m["buttons"][0]] == [f"tk:{tid}:tmr", f"tk:{tid}:keep"]
 
 
 # ---------- классификация ----------

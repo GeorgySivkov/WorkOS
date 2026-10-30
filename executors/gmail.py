@@ -68,8 +68,21 @@ def build_mime(p: dict) -> bytes:
     return msg.as_bytes()
 
 
-def execute(action: dict, notify) -> dict:  # noqa: ARG001
+def manual_accounts() -> set[str]:
+    """Ящики без API черновиков (Альфа: Exchange по ActiveSync). Для них черновик
+    приходит текстом в «Решения», отправляет George сам из своего клиента."""
+    return {x.strip() for x in (config.env("MANUAL_DRAFT_ACCOUNTS", "alfa,eas:alfa") or "").split(",") if x.strip()}
+
+
+def execute(action: dict, notify) -> dict:
     p = action["payload"]
+    if p["account"].strip() in manual_accounts():
+        head = f"Кому: {base.esc(', '.join(p['to']))}"
+        if p["cc"]:
+            head += f"\nКопия: {base.esc(', '.join(p['cc']))}"
+        notify(f"Черновик ответа ({base.esc(p['account'])}), скопируй в почту:\n{head}\n"
+               f"Тема: {base.esc(p['subject'])}\n<pre>{base.esc(p['body'])}</pre>")
+        return {"manual": True, "account": p["account"]}
     env_name = token_env(p["account"])
     raw = base64.urlsafe_b64encode(build_mime(p)).decode().rstrip("=")
     message: dict = {"raw": raw}

@@ -125,3 +125,12 @@ def test_rpg_award_cap_and_idempotency(admin, as_role):
     assert app.execute("SELECT rpg.log_manual('A1') AS n").fetchone()["n"] == 0
     app.execute("SELECT rpg.revoke_manual('A1')")
     assert admin.execute("SELECT count(*) AS n FROM rpg.xp").fetchone()["n"] == 0
+
+
+def test_reader_cannot_insert_approved_action(as_role, admin):
+    reader = as_role("workos_reader")
+    reader.execute("""INSERT INTO work.actions (context_id, type, payload, status, approved_hash, approved_at)
+                      VALUES ('personal', 'slack_post', '{"channel":"C1","text":"x"}', 'approved',
+                              encode(sha256(convert_to('{"text": "x", "channel": "C1"}', 'UTF8')), 'hex'), now())""")
+    row = admin.execute("SELECT status, approved_hash, approved_at FROM work.actions").fetchone()
+    assert row == {"status": "proposed", "approved_hash": None, "approved_at": None}

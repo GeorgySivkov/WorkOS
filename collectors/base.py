@@ -154,8 +154,10 @@ def run_source(source_id: str, collector: Collector | None = None) -> dict:
 
 
 def run_enabled(kind: str | None = None) -> list[dict]:
+    """Все включённые источники, кроме тех, у кого свой процесс:
+    telegram (бот), achat (приём с Мака), eas (сервис eas-watch на Ping)."""
     with db.connect() as conn:
-        q = "SELECT id FROM work.sources WHERE enabled AND kind NOT IN ('telegram','achat')"
+        q = "SELECT id FROM work.sources WHERE enabled AND kind NOT IN ('telegram','achat','eas')"
         rows = conn.execute(q + (" AND kind = %s" if kind else "") + " ORDER BY id",
                             (kind,) if kind else ()).fetchall()
     out = []
