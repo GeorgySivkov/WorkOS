@@ -193,3 +193,14 @@ def test_weekly_proposes_quests_for_lagging(admin, role_env, no_autonomy):
     assert weekly.run(now=now)["skipped"]
     # обычное воскресенье: сезона нет
     assert weekly.run(now=at(2026, 10, 11, 20), dry_run=True)["season"] is False
+
+
+def test_garmin_activity_type_alternatives():
+    from datetime import date
+    from rpg import garmin
+    rule = garmin.parse_source("garmin:activity:cycling|biking:60")
+    d = date(2026, 11, 10)
+    acts = {d: [{"type": "road_biking", "minutes": 75}]}
+    assert garmin.met(rule, d, acts, {}, None)
+    acts = {d: [{"type": "walking", "minutes": 75}]}
+    assert not garmin.met(rule, d, acts, {}, None)

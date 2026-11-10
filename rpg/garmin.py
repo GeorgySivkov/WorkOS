@@ -4,6 +4,7 @@
     garmin:activity             любая тренировка от 20 минут за день
     garmin:activity:strength    силовая (тип содержит 'strength') от 20 минут
     garmin:activity:running:40  бег от 40 минут
+    garmin:activity:cycling|biking:60  велосипед любого вида (cycling, road_biking, mountain_biking) от 60 минут
     garmin:sleep:7.5            сон от 7,5 часа (ночь, после которой начался день)
     garmin:steps:10000          от 10 000 шагов за день
 Начисление: rpg.xp source='garmin', source_ref='<клетка>:<дата>', ON CONFLICT DO NOTHING,
@@ -118,7 +119,8 @@ def parse_source(src: str) -> dict | None:
 def met(rule: dict, d: date, acts: dict[date, list[dict]], cache: dict, client) -> bool:
     if rule["kind"] == "activity":
         for a in acts.get(d, []):
-            if rule["type"] and rule["type"] not in a["type"]:
+            # тип можно задать вариантами через «|»: cycling|biking ловит road_biking и indoor_cycling
+            if rule["type"] and not any(t in a["type"] for t in rule["type"].split("|") if t):
                 continue
             if a["minutes"] >= rule["minutes"]:
                 return True
