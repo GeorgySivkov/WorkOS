@@ -307,10 +307,11 @@ class Api:
     def _habits(self, conn, today: date) -> list[dict]:
         lo, hi = tu.day_bounds(today)
         rows = conn.execute(
-            """SELECT c.id, c.title, c.auto_source, c.xp_base,
+            """SELECT c.id, c.title, c.auto_source, c.xp_base, p.title AS dir,
                       EXISTS (SELECT 1 FROM rpg.xp x WHERE x.cell_id = c.id
                               AND x.earned_at >= %s AND x.earned_at < %s) AS done
-               FROM rpg.cells c WHERE c.kind = 'habit' AND c.active ORDER BY c.id""", (lo, hi)).fetchall()
+               FROM rpg.cells c LEFT JOIN rpg.cells p ON p.id = c.parent
+               WHERE c.kind = 'habit' AND c.active ORDER BY c.id""", (lo, hi)).fetchall()
         facts = self._xp_days(conn)
         out = []
         for r in rows:
@@ -325,7 +326,7 @@ class Api:
                 note = f"+{r['xp_base']} опыта"
             via = None if not src else "garmin" if src.startswith("garmin") \
                 else "rating" if src.startswith("rating") else "auto"
-            out.append({"cell_id": r["id"], "title": r["title"], "note": note, "done": bool(r["done"]),
+            out.append({"cell_id": r["id"], "title": r["title"], "dir": r["dir"], "note": note, "done": bool(r["done"]),
                         "auto": src is not None, "via": via, "streak": n})
         return out
 
@@ -353,7 +354,7 @@ class Api:
                 unscheduled.append(t)
         unscheduled.sort(key=lambda t: (t["done"], not t["overdue"], t["due"] or "9999", t["id"]))
 
-        busy, seen = [], set()
+        busy, seen, cal_training = [], set(), False
         for ev in scheduler.feed_events(conn, day):
             s, e = ev["starts_at"], ev["ends_at"]
             if ev["busy"]:
@@ -364,12 +365,19 @@ class Api:
             seen.add(key)
             cid = ev["context_id"]
             ctx = CTX_TITLES.get(cid, "")
+            if TRAIN_RX.search(ev["title"] or ""):          # тренировка из календаря: день тренировки он и задаёт
+                attr, done = self._training_info(conn, lo, hi)
+                cal_training = True
+                items.append((s, e, 3, {
+                    "type": "training", "time": tu.hm(s), "title": ev["title"],
+                    "meta": f"{tu.hm(s)}–{tu.hm(e)} · {attr}", "start": iso(s), "end": iso(e), "done": done}))
+                continue
             items.append((s, e, 1, {
                 "type": "meeting", "id": ev["id"], "title": ev["title"] or "Встреча", "context_id": cid,
                 "color": COLORS.get(cid, NO_COLOR), "time": tu.hm(s), "start": iso(s), "end": iso(e),
                 "meta": f"{tu.hm(s)}–{tu.hm(e)}" + (f" · {ctx}" if ctx else ""), "location": ev["location"]}))
 
-        if not any(TRAIN_RX.search(t["title"] or "") for t in tasks):
+        if not cal_training and not any(TRAIN_RX.search(t["title"] or "") for t in tasks):
             fixed = [{"id": f"t{x['id']}", "planned_by": "manual", "planned_start": s, "planned_end": e}
                      for s, e, _, x in items if x["type"] == "task"]
             slot = scheduler.place(day, fixed, busy).get("training")
@@ -428,7 +436,7 @@ class Api:
                       EXISTS (SELECT 1 FROM rpg.xp x WHERE x.cell_id = c.id
                               AND x.earned_at >= %s AND x.earned_at < %s) AS done
                FROM rpg.cells c LEFT JOIN rpg.cells p ON p.id = c.parent
-               WHERE c.active AND c.kind = 'habit' AND c.title ILIKE '%%трениров%%'
+               WHERE c.active AND c.kind = 'habit' AND c.title ~* '(трениров|силов)'
                ORDER BY c.id LIMIT 1""", (lo, hi)).fetchone()
         if not r:
             return "Здоровье", False

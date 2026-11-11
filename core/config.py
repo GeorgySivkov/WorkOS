@@ -41,7 +41,9 @@ LOGICAL_DAY_END_HOUR = env_int("WORKOS_DAY_END_HOUR", 4)   # день конча
 TRAINING_WINDOW = (env("WORKOS_TRAIN_FROM", "21:00"), env("WORKOS_TRAIN_TO", "00:00"))
 TRAINING_DEFAULT = env("WORKOS_TRAIN_DEFAULT", "21:30")
 TRAINING_MINUTES = env_int("WORKOS_TRAIN_MINUTES", 90)
-TRAINING_WEEKDAYS = [int(x) for x in env("WORKOS_TRAIN_WEEKDAYS", "0,1,2,3,4,5,6").split(",") if x != ""]
+# дни, когда тренировку ставить «вслепую» (0 = пн). По умолчанию пусто: тренировка берётся из календаря,
+# событие с «тренировк» в названии (у George это «Силовая тренировка» в личном календаре)
+TRAINING_WEEKDAYS = [int(x) for x in env("WORKOS_TRAIN_WEEKDAYS", "").split(",") if x.strip() != ""]
 
 # ---------- план дня (шаг 2.9) ----------
 SIZE_MINUTES = {"S": 30, "M": 60, "L": 120}

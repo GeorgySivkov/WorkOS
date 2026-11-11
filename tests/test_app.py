@@ -228,6 +228,7 @@ def test_habit_toggle(c, admin):
     habits = {h["cell_id"]: h for h in c.get("/api/today").json()["habits"]}
     assert habits["A2"]["done"] is True and habits["A2"]["auto"] is False
     assert habits["A1"]["auto"] is True and habits["A1"]["note"] == "из Garmin"
+    assert habits["A2"]["dir"] == "Здоровье"
     r = c.post("/api/habits/A2/toggle").json()
     assert r["done"] is False and r["xp"] == 0 and r["character"]["xp"] == 0
     assert c.post("/api/habits/A1/toggle").status_code == 400      # из Garmin руками не отмечается
@@ -278,7 +279,9 @@ def test_rating_slider(c, admin, as_role):
 
 # ---------- лента дня и пересборка ----------
 
-def test_today_timeline(c, srv, admin):
+def test_today_timeline(c, srv, admin, monkeypatch):
+    from core import config
+    monkeypatch.setattr(config, "TRAINING_WEEKDAYS", list(range(7)))     # режим «тренировка каждый день»
     seed_grid(admin)
     day = tu.logical_today()
     fix_clock(srv, at(day, 9))
@@ -309,6 +312,22 @@ def test_today_timeline(c, srv, admin):
     assert t["unscheduled"][0]["id"] == overdue and t["unscheduled"][0]["overdue"] is True
     assert t["summary"] == {"done": 1, "total": 3, "xp_today": 0}
     assert t["character"]["level"] == 0
+
+
+def test_training_comes_from_calendar(c, srv, admin):
+    """По умолчанию тренировку не угадываем: есть «Силовая тренировка» в календаре, значит день тренировки."""
+    seed_grid(admin)
+    admin.execute("UPDATE rpg.cells SET title = 'Силовая раз в 2 дня' WHERE id = 'A3'")
+    day = tu.logical_today()
+    fix_clock(srv, at(day, 9))
+    kinds = lambda t: [x["type"] for x in t["timeline"]]        # noqa: E731
+    assert "training" not in kinds(c.get("/api/today").json())   # события нет: день отдыха
+    add_event(admin, "tr1", at(day, 20), at(day, 21, 30), "Силовая тренировка", ctx="personal")
+    t = c.get("/api/today").json()
+    tr = [x for x in t["timeline"] if x["type"] == "training"]
+    assert len(tr) == 1 and "meeting" not in kinds(t)
+    assert tr[0]["time"] == "20:00" and tr[0]["title"] == "Силовая тренировка"
+    assert tr[0]["meta"] == "20:00–21:30 · Здоровье" and tr[0]["done"] is False
 
 
 def test_replan_api(c, srv, admin):

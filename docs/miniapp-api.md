@@ -30,7 +30,7 @@ Env `.env.app`: PG* роли workos_app, `TELEGRAM_BOT_ID`, `TELEGRAM_OWNER_ID`,
 {"date": "2026-10-22", "date_label": "Четверг, 22 октября", "week": 43, "now": "ISO",
  "character": {"name": "Георгий", "level": 7, "xp": 1440, "level_floor": 1400, "next_level_at": 1600},
  "summary": {"done": 1, "total": 5, "xp_today": 10},
- "habits": [{"cell_id": "A1", "title": "Сон 7,5 ч", "note": "из Garmin", "done": true, "auto": true,
+ "habits": [{"cell_id": "A1", "title": "Сон 7,5 ч", "dir": "Здоровье", "note": "из Garmin", "done": true, "auto": true,
              "via": "garmin|rating|auto|null", "streak": 12}],
  "rating": {"day": "2026-10-22", "score": 3, "note": "устал, но доволен", "month_avg": 2.4, "month_days": 12},
  "timeline": [

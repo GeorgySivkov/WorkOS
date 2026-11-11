@@ -306,7 +306,7 @@
 
   // ---------- состояние и API ----------
   const S = { tab: 'today', today: null, list: { week: null, later: null }, view: 'week', character: null, grid: null,
-    sel: null, talk: 0, pending: new Set(), fxUntil: 0, rateDraft: null };
+    sel: null, talk: 0, pending: new Set(), fxUntil: 0, rateDraft: null, habitsOpen: false };
   let T = null;              // живые ссылки экрана «Сегодня»
   let closeSheet = null;
 
@@ -400,7 +400,7 @@
     const sc = buildScene('small', { label: 'Персонаж, уровень ' + d.character.level, onHero: () => show('character') });
     sc.el.append(h('div', { class: 'scene-title' }, h('span', { class: 'kicker' }, 'Неделя ' + d.week), h('h1', null, d.date_label)));
     const st = statusPanel();
-    const habits = h('div', { class: 'habits', role: 'group', 'aria-label': 'Ритуалы дня' });
+    const habits = h('section', { class: 'habits', 'aria-labelledby': 'h-title' });
     const quests = h('section', { class: 'quests', 'aria-labelledby': 'q-title' });
     const rate = d.rating ? ratePanel(d.rating) : null;
     T = { sc: sc, st: st, habits: habits, quests: quests, rate: rate };
@@ -551,19 +551,46 @@
     }
     r.sub.textContent = 'Квесты ' + sum.done + ' из ' + sum.total + ' · сегодня +' + sum.xp_today + ' опыта';
   }
+  // ритуалы: по умолчанию 6 несделанных (сначала ручные), остальные по кнопке, по направлениям
+  const HABITS_SHOWN = 6;
   function paintHabits() {
-    T.habits.replaceChildren.apply(T.habits, S.today.habits.map((hb) => {
-      const b = h('button', { type: 'button', class: 'habit' + (hb.done ? ' on' : '') + (hb.auto ? ' auto' : ''),
-        'aria-pressed': String(!!hb.done), 'aria-disabled': hb.auto && hb.via !== 'rating' ? 'true' : null },
-      h('span', { class: 'gem', 'aria-hidden': 'true' }),
-      h('span', { class: 'txt' }, h('span', { class: 'hn' }, hb.title), h('span', { class: 'hs' }, hb.note || '')));
-      const label = () => b.setAttribute('aria-label', (hb.via === 'rating' ? 'Ритуал отмечается оценкой дня, перейти к ползунку' + (hb.done ? ', выполнен: ' : ': ')
-        : hb.auto ? 'Ритуал отмечается сам' + (hb.done ? ', выполнен: ' : ': ')
-        : hb.done ? 'Ритуал выполнен, снять отметку: ' : 'Отметить ритуал: ') + hb.title);
-      label();
-      b.addEventListener('click', () => toggleHabit(hb, b, label));
-      return b;
-    }));
+    const all = S.today.habits;
+    const open = !!S.habitsOpen;
+    const kids = [secTitle('Ритуалы дня', 'h-title', all.filter((x) => x.done).length + '/' + all.length)];
+    let shown = 0;
+    if (open) {
+      let dir = null;
+      for (const hb of all) {
+        if ((hb.dir || '') !== dir) { dir = hb.dir || ''; if (dir) kids.push(h('div', { class: 'hdir' }, dir)); }
+        kids.push(habitRow(hb));
+      }
+      shown = all.length;
+    } else {
+      const undone = all.filter((x) => !x.done);
+      const pick = undone.filter((x) => !x.auto).concat(undone.filter((x) => x.auto)).slice(0, HABITS_SHOWN);
+      for (const hb of pick) kids.push(habitRow(hb));
+      if (!pick.length) kids.push(h('p', { class: 'empty' }, 'Все ритуалы на сегодня отмечены'));
+      shown = pick.length;
+    }
+    if (open || shown < all.length) {
+      kids.push(h('button', { type: 'button', class: 'hmore', 'aria-expanded': String(open), onclick: () => {
+        S.habitsOpen = !open;
+        paintHabits();
+        if (open) T.habits.scrollIntoView({ block: 'nearest', behavior: reduced() ? 'auto' : 'smooth' });
+      } }, open ? 'Свернуть' : 'Все ритуалы · ' + all.length));
+    }
+    T.habits.replaceChildren.apply(T.habits, kids);
+  }
+  function habitRow(hb) {
+    const b = h('button', { type: 'button', class: 'habit' + (hb.done ? ' on' : '') + (hb.auto ? ' auto' : ''),
+      'aria-pressed': String(!!hb.done), 'aria-disabled': hb.auto && hb.via !== 'rating' ? 'true' : null },
+    h('span', { class: 'gem', 'aria-hidden': 'true' }), h('span', { class: 'hn' }, hb.title), h('span', { class: 'hs' }, hb.note || ''));
+    const label = () => b.setAttribute('aria-label', (hb.via === 'rating' ? 'Ритуал отмечается оценкой дня, перейти к ползунку' + (hb.done ? ', выполнен: ' : ': ')
+      : hb.auto ? 'Ритуал отмечается сам' + (hb.done ? ', выполнен: ' : ': ')
+      : hb.done ? 'Ритуал выполнен, снять отметку: ' : 'Отметить ритуал: ') + hb.title);
+    label();
+    b.addEventListener('click', () => toggleHabit(hb, b, label));
+    return b;
   }
   function paintQuests() {
     const d = S.today;
@@ -1073,10 +1100,15 @@
       { title: 'Альфа: синк по поддержке', ctx: 'alfa', s: at(13, 0), e: at(14, 0) },
     ];
     const habits = [
-      { cell_id: 'A1', title: 'Сон 7,5 ч', note: 'из Garmin', done: true, auto: true, via: 'garmin' },
-      { cell_id: 'A2', title: 'Растяжка', note: 'серия 4', done: false, auto: false, via: null },
-      { cell_id: 'B3', title: 'Оценка дня', note: 'оценкой дня', done: false, auto: true, via: 'rating' },
-      { cell_id: 'E1', title: 'Английский', note: '+10 опыта', done: false, auto: false, via: null },
+      { cell_id: 'A1', dir: 'Здоровье', title: 'Сон 7,5 часа', note: 'из Garmin', done: true, auto: true, via: 'garmin' },
+      { cell_id: 'A2', dir: 'Здоровье', title: 'Растяжка 10 минут после работы', note: 'серия 4', done: false, auto: false, via: null },
+      { cell_id: 'A3', dir: 'Здоровье', title: '10 000 шагов в день', note: 'из Garmin', done: false, auto: true, via: 'garmin' },
+      { cell_id: 'B3', dir: 'Карьера', title: 'Оценка дня от -10 до +10', note: 'оценкой дня', done: false, auto: true, via: 'rating' },
+      { cell_id: 'B4', dir: 'Карьера', title: 'Разговор с наставником раз в 14 дней', note: '+10 опыта', done: false, auto: false, via: null },
+      { cell_id: 'E1', dir: 'Знания', title: 'Английский 20 минут', note: '+10 опыта', done: false, auto: false, via: null },
+      { cell_id: 'E2', dir: 'Знания', title: 'Глава книги про продуктовые метрики', note: '+10 опыта', done: false, auto: false, via: null },
+      { cell_id: 'G1', dir: 'Дом', title: 'Порядок по субботам', note: 'серия 1', done: false, auto: false, via: null },
+      { cell_id: 'H1', dir: 'Свобода', title: 'Шаг по документам раз в 7 дней', note: '+10 опыта', done: false, auto: false, via: null },
     ];
     const rated = { score: null, past: [3, 5, -2, 4, 6, 2, 0, 7, 4, 3, -1, 5] };      // прошлые дни месяца
     function rating() {

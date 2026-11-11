@@ -10,6 +10,13 @@ UTC = timezone.utc
 WED = date(2026, 10, 21)
 
 
+
+@pytest.fixture(autouse=True)
+def train_every_day(monkeypatch):
+    """Эти тесты про «слепую» тренировку по дням недели; по умолчанию она выключена (берётся из календаря)."""
+    monkeypatch.setattr(config, "TRAINING_WEEKDAYS", list(range(7)))
+
+
 def at(d, hh, mm=0, plus_days=0):
     return tu.at_local(d + timedelta(days=plus_days), time(hh, mm))
 
