@@ -27,7 +27,7 @@ cd /opt/workos && git fetch && git checkout build/all-phases && git pull
 apt-get update && apt-get install -y python3-venv     # остальное (ffmpeg, age, клиент Postgres) ставит install.sh
 cp deploy/env/admin.example .env.admin && nano .env.admin   # doadmin + пароли новых ролей
 bash deploy/install.sh                                 # пользователи, права, пакеты, своп, venv, systemd
-WORKOS_ROLE=admin .venv/bin/python migrate.py          # миграции 002-011
+WORKOS_ROLE=admin .venv/bin/python migrate.py          # миграции 002-012
 WORKOS_ROLE=admin .venv/bin/python migrate.py --status # всё с галочками
 ```
 `migrate.py` сам увидит, что схема из шага 0.3 уже стоит, и не будет её трогать.
@@ -115,7 +115,8 @@ done
    `sudo -u workos-reader WORKOS_ROLE=reader .venv/bin/python workctl.py garmin-login`
    (если включена MFA, он спросит код). Токены лягут в `GARMIN_TOKENS`, после этого пароль из `.env.reader` сотри.
    Клетки уже привязаны в JSON (сон, шаги, силовые, сноуборд, хайкинг, велосипед, прогулки).
-3. **Оценка дня:** `/day +3 заметка` в боте, а после 00:30 бот сам спросит «Как прошёл день?» с кнопками.
+3. **Оценка дня:** ползунок от -10 до +10 на «Сегодня» в мини-приложении, или `/day +3 заметка` в боте;
+   после 00:30, если день не оценён, бот сам спросит «Как прошёл день?» с кнопками.
    Привычка «Оценка дня» и этап «Месяц со средней оценкой +3» засчитываются сами.
 4. `bash deploy/phase.sh persona`
 5. **Готово, когда:** отметка задачи в мини-приложении дала опыт, `/me` в теме «План» показывает те же цифры,

@@ -306,7 +306,7 @@
 
   // ---------- состояние и API ----------
   const S = { tab: 'today', today: null, list: { week: null, later: null }, view: 'week', character: null, grid: null,
-    sel: null, talk: 0, pending: new Set(), fxUntil: 0 };
+    sel: null, talk: 0, pending: new Set(), fxUntil: 0, rateDraft: null };
   let T = null;              // живые ссылки экрана «Сегодня»
   let closeSheet = null;
 
@@ -402,11 +402,115 @@
     const st = statusPanel();
     const habits = h('div', { class: 'habits', role: 'group', 'aria-label': 'Ритуалы дня' });
     const quests = h('section', { class: 'quests', 'aria-labelledby': 'q-title' });
-    T = { sc: sc, st: st, habits: habits, quests: quests };
+    const rate = d.rating ? ratePanel(d.rating) : null;
+    T = { sc: sc, st: st, habits: habits, quests: quests, rate: rate };
     paintStatus(d.character, d.summary, false);
     paintHabits();
     paintQuests();
-    return h('div', { class: 'screen' }, sc.el, st.el, d.habits.length ? habits : null, quests);
+    return h('div', { class: 'screen' }, sc.el, st.el, d.habits.length ? habits : null, rate ? rate.el : null, quests);
+  }
+
+  // ---------- оценка дня: ползунок -10..+10, пишет rpg.log_rating (как /day в боте) ----------
+  const MON_NOM = ['январь', 'февраль', 'март', 'апрель', 'май', 'июнь', 'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь'];
+  const signed = (n) => {
+    if (n == null) return '–';
+    const v = Number(n);
+    if (v === 0) return '0';
+    const s = Number.isInteger(v) ? String(Math.abs(v)) : Math.abs(v).toFixed(1).replace('.', ',');
+    return (v > 0 ? '+' : '−') + s;
+  };
+  function ratePanel(rt) {
+    // недосохранённое значение переживает фоновое обновление экрана
+    const draft = S.rateDraft && S.rateDraft.day === rt.day ? S.rateDraft.value : null;
+    const val = h('output', { class: 'rv', for: 'rate-in' });
+    const input = h('input', { id: 'rate-in', type: 'range', min: '-10', max: '10', step: '1',
+      value: String(draft != null ? draft : rt.score != null ? rt.score : 0) });
+    const save = h('button', { type: 'button', class: 'btn-gold rsave' });
+    const month = h('span', { class: 'rm' });
+    const el = h('section', { class: 'rate', 'aria-labelledby': 'rate-title' },
+      h('div', { class: 'rhead' }, h('span', { class: 'dia', 'aria-hidden': 'true' }), h('h2', { id: 'rate-title' }, 'Оценка дня'), val),
+      h('div', { class: 'rtrack' }, input),
+      h('div', { class: 'rticks', 'aria-hidden': 'true' }, h('span', null, '−10'), h('span', null, '0'), h('span', null, '+10')),
+      h('div', { class: 'rfoot' }, month, save));
+    const R = { el: el, input: input, val: val, save: save, month: month, busy: false };
+    const paint = () => {
+      const r = S.today.rating;
+      const v = Number(input.value);
+      const dirty = r.score == null || v !== r.score;
+      const touched = !!(S.rateDraft && S.rateDraft.day === r.day);
+      const blank = r.score == null && !touched;          // ещё не оценён и ползунок не трогали
+      val.textContent = blank ? '–' : signed(v);
+      val.className = 'rv' + (blank ? ' blank' : v > 0 ? ' up' : v < 0 ? ' down' : '');
+      const p = (v + 10) * 5;
+      const lo = Math.min(50, p), hi = Math.max(50, p);
+      const col = v > 0 ? 'var(--jade)' : v < 0 ? 'var(--rose)' : 'var(--gold)';
+      input.style.setProperty('--trk', 'linear-gradient(90deg, #1A2050 ' + lo + '%, ' + col + ' ' + lo + '%, ' + col + ' ' + hi + '%, #1A2050 ' + hi + '%)');
+      input.setAttribute('aria-valuetext', signed(v) + (r.score == null ? ', день ещё не оценён' : dirty ? ', не сохранено' : ', записано'));
+      input.setAttribute('aria-label', 'Оценка дня от минус 10 до плюс 10');
+      save.textContent = R.busy ? 'Пишу…' : r.score == null ? 'Записать' : dirty ? 'Обновить' : 'Записано';
+      save.disabled = R.busy || !dirty;
+      const mname = MON_NOM[Number(r.day.slice(5, 7)) - 1];
+      month.textContent = r.month_days
+        ? mname.replace(/^./, (s) => s.toUpperCase()) + ': в среднем ' + signed(r.month_avg) + ' · ' + r.month_days + ' дн.'
+        : 'Первая оценка в этом месяце';
+      if (r.note && !dirty) month.textContent += ' · ' + r.note;
+    };
+    R.paint = paint;
+    input.addEventListener('input', () => {
+      S.rateDraft = { day: S.today.rating.day, value: Number(input.value) };
+      S.fxUntil = Math.max(S.fxUntil || 0, Date.now() + 4000);      // пока тянешь, экран не перерисуется
+      haptic('select');
+      paint();
+    });
+    save.addEventListener('click', () => saveRating(R));
+    paint();
+    return R;
+  }
+  async function saveRating(R) {
+    if (R.busy) return;
+    const score = Number(R.input.value);
+    R.busy = true;
+    R.paint();
+    try {
+      const r = await api('POST', 'api/rating', { score: score });
+      S.rateDraft = null;
+      const before = S.today.character;
+      S.today.rating = r.rating;
+      applyCharacter(r.character);
+      S.today.summary.xp_today += r.xp || 0;
+      if (r.xp > 0) S.today.habits.forEach((x) => { if (x.via === 'rating') x.done = true; });
+      if (T && T.rate === R) {
+        paintStatus(S.today.character, S.today.summary, !!r.level_up);
+        paintHabits();
+      }
+      const msg = 'Оценка дня ' + signed(score) + (r.xp > 0 ? ', +' + r.xp + ' опыта' : '');
+      announce(msg);
+      if (r.xp > 0 && T) {
+        haptic('notify', 'success');
+        S.fxUntil = Date.now() + (r.milestone || r.level_up ? 3400 : 1400);
+        heroCheer(T.sc, 1200);
+        floatXp(T.sc, '+' + r.xp + ' XP');
+      } else {
+        haptic('impact', 'light');
+        toast('Записал: ' + signed(score));
+      }
+      if (r.milestone && T) {
+        sparks(T.sc);
+        ribbon(T.sc, 'Этап пройден', r.milestone.title + ' · +' + r.milestone.xp);
+      }
+      if (r.level_up) setTimeout(() => levelUp(before.level, r.character.level), r.milestone ? 1200 : 300);
+      scheduleRefresh();
+    } catch (e) {
+      handleErr(e);
+    } finally {
+      R.busy = false;
+      R.paint();
+    }
+  }
+  function focusRating() {
+    if (!T || !T.rate) return;
+    T.rate.el.scrollIntoView({ behavior: reduced() ? 'auto' : 'smooth', block: 'center' });
+    T.rate.input.focus({ preventScroll: true });
   }
   function statusPanel() {
     const lvl = h('span');
@@ -450,10 +554,11 @@
   function paintHabits() {
     T.habits.replaceChildren.apply(T.habits, S.today.habits.map((hb) => {
       const b = h('button', { type: 'button', class: 'habit' + (hb.done ? ' on' : '') + (hb.auto ? ' auto' : ''),
-        'aria-pressed': String(!!hb.done), 'aria-disabled': hb.auto ? 'true' : null },
+        'aria-pressed': String(!!hb.done), 'aria-disabled': hb.auto && hb.via !== 'rating' ? 'true' : null },
       h('span', { class: 'gem', 'aria-hidden': 'true' }),
       h('span', { class: 'txt' }, h('span', { class: 'hn' }, hb.title), h('span', { class: 'hs' }, hb.note || '')));
-      const label = () => b.setAttribute('aria-label', (hb.auto ? 'Ритуал из Garmin' + (hb.done ? ', выполнен: ' : ': ')
+      const label = () => b.setAttribute('aria-label', (hb.via === 'rating' ? 'Ритуал отмечается оценкой дня, перейти к ползунку' + (hb.done ? ', выполнен: ' : ': ')
+        : hb.auto ? 'Ритуал отмечается сам' + (hb.done ? ', выполнен: ' : ': ')
         : hb.done ? 'Ритуал выполнен, снять отметку: ' : 'Отметить ритуал: ') + hb.title);
       label();
       b.addEventListener('click', () => toggleHabit(hb, b, label));
@@ -599,7 +704,8 @@
     }
   }
   async function toggleHabit(hb, b, label) {
-    if (hb.auto) { toast('Этот ритуал отмечается сам, из Garmin'); return; }
+    if (hb.via === 'rating') { toast('Отмечается оценкой дня: ползунок ниже'); focusRating(); return; }
+    if (hb.auto) { toast(hb.via === 'garmin' ? 'Этот ритуал отмечается сам, из Garmin' : 'Этот ритуал отмечается сам'); return; }
     const key = 'h:' + hb.cell_id;
     if (S.pending.has(key)) return;
     S.pending.add(key);
@@ -967,10 +1073,29 @@
       { title: 'Альфа: синк по поддержке', ctx: 'alfa', s: at(13, 0), e: at(14, 0) },
     ];
     const habits = [
-      { cell_id: 'A1', title: 'Сон 7,5 ч', note: 'из Garmin', done: true, auto: true },
-      { cell_id: 'A2', title: 'Растяжка', note: 'серия 4', done: false, auto: false },
-      { cell_id: 'E1', title: 'Английский', note: '+10 опыта', done: false, auto: false },
+      { cell_id: 'A1', title: 'Сон 7,5 ч', note: 'из Garmin', done: true, auto: true, via: 'garmin' },
+      { cell_id: 'A2', title: 'Растяжка', note: 'серия 4', done: false, auto: false, via: null },
+      { cell_id: 'B3', title: 'Оценка дня', note: 'оценкой дня', done: false, auto: true, via: 'rating' },
+      { cell_id: 'E1', title: 'Английский', note: '+10 опыта', done: false, auto: false, via: null },
     ];
+    const rated = { score: null, past: [3, 5, -2, 4, 6, 2, 0, 7, 4, 3, -1, 5] };      // прошлые дни месяца
+    function rating() {
+      const all = rated.past.concat(rated.score == null ? [] : [rated.score]);
+      const avg = Math.round(all.reduce((a, b) => a + b, 0) * 10 / all.length) / 10;
+      return { day: T0, score: rated.score, note: null, month_avg: avg, month_days: all.length };
+    }
+    function rate(body) {
+      const v = body && body.score;
+      if (!Number.isInteger(v) || v < -10 || v > 10) throw Object.assign(new Error('score: целое от -10 до +10'), { status: 400 });
+      const first = rated.score == null;
+      const before = lvlOf(st.xp);
+      rated.score = v;
+      const hb = habits.find((x) => x.via === 'rating');
+      const xp = first ? 15 : 0;
+      if (first && hb) hb.done = true;
+      st.xp += xp;
+      return { rating: rating(), xp: xp, milestone: null, week_avg: null, level_up: lvlOf(st.xp) > before, character: character() };
+    }
     function character() {
       const L = lvlOf(st.xp);
       return { name: 'Георгий', level: L, xp: st.xp, level_floor: 50 * L * (L + 1), next_level_at: 50 * (L + 1) * (L + 2) };
@@ -1023,10 +1148,11 @@
       items.push([now, now, -1, { type: 'now', time: hm(now) }]);
       items.sort((a, b) => (a[0] - b[0]) || (a[2] - b[2]));
       const done = list.filter((t) => t.done).length;
-      const xpToday = list.filter((t) => t.done).reduce((a, t) => a + (t.got || 0), 0) + habits.filter((x) => x.done && !x.auto).length * 10;
+      const xpToday = list.filter((t) => t.done).reduce((a, t) => a + (t.got || 0), 0) + habits.filter((x) => x.done && !x.auto).length * 10
+        + (rated.score != null ? 15 : 0);
       return { date: T0, date_label: WD_FULL[wdIdx(day0)].replace(/^./, (s) => s.toUpperCase()) + ', ' + dayMonth(T0), week: isoWeek(day0),
         now: now.toISOString(), character: character(), summary: { done: done, total: list.length, xp_today: xpToday },
-        habits: habits.map((x) => Object.assign({}, x)), timeline: items.map((i) => i[3]), unscheduled: uns };
+        habits: habits.map((x) => Object.assign({}, x)), rating: rating(), timeline: items.map((i) => i[3]), unscheduled: uns };
     }
     function listView(v) {
       const open = tasks.filter((t) => !t.done && !t.dropped);
@@ -1131,6 +1257,7 @@
       if (p === 'character') return characterView();
       if (p === 'grid') return GRID;
       if (p === 'tasks') return create(body || {});
+      if (p === 'rating') return rate(body);
       if (p === 'replan') {
         const open = tasks.filter((t) => !t.done && !t.dropped && t.due === T0);
         return Object.assign(today(), { replan: { placed: open.filter((t) => t.start).length, unplaced: open.filter((t) => !t.start).length } });

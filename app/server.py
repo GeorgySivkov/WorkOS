@@ -212,6 +212,7 @@ class Api:
         ("POST", re.compile(r"/api/tasks"), "create"),
         ("POST", re.compile(r"/api/tasks/(\d{1,18})/(done|undone|tomorrow|drop)"), "task_action"),
         ("POST", re.compile(r"/api/habits/([A-Za-z0-9_.:-]{1,32})/toggle"), "habit"),
+        ("POST", re.compile(r"/api/rating"), "rating"),
         ("POST", re.compile(r"/api/replan"), "replan"),
         ("GET", re.compile(r"/api/character"), "character"),
         ("GET", re.compile(r"/api/grid"), "grid"),
@@ -317,13 +318,15 @@ class Api:
             src = r["auto_source"]
             if src:
                 note = ("из Garmin" if src.startswith("garmin")
-                        else "через /day в боте" if src.startswith("rating") else "сама")
+                        else "оценкой дня" if src.startswith("rating") else "сама")
             elif n:
                 note = f"серия {n}"
             else:
                 note = f"+{r['xp_base']} опыта"
+            via = None if not src else "garmin" if src.startswith("garmin") \
+                else "rating" if src.startswith("rating") else "auto"
             out.append({"cell_id": r["id"], "title": r["title"], "note": note, "done": bool(r["done"]),
-                        "auto": src is not None, "streak": n})
+                        "auto": src is not None, "via": via, "streak": n})
         return out
 
     # --- GET /api/today ---
@@ -398,8 +401,25 @@ class Api:
             "date": day.isoformat(), "date_label": date_label(day), "week": day.isocalendar()[1],
             "now": iso(now), "character": self.character_of(conn),
             "summary": {"done": sum(t["done"] for t in tasks), "total": len(tasks), "xp_today": xp_today},
-            "habits": self._habits(conn, day), "timeline": timeline, "unscheduled": unscheduled,
+            "habits": self._habits(conn, day), "rating": self._rating(conn),
+            "timeline": timeline, "unscheduled": unscheduled,
         }
+
+    @staticmethod
+    def _rating(conn) -> dict:
+        """Оценка текущего логического дня и среднее за месяц. День берётся из часов базы,
+        как в rpg.log_rating: показываем ровно тот день, в который запишется ползунок."""
+        r = conn.execute(
+            """WITH d AS (SELECT rpg.lday(now()) AS day)
+               SELECT d.day, r.score, r.note,
+                      (SELECT round(avg(score), 1) FROM rpg.day_ratings
+                        WHERE day >= date_trunc('month', d.day)::date AND day <= d.day) AS month_avg,
+                      (SELECT count(*) FROM rpg.day_ratings
+                        WHERE day >= date_trunc('month', d.day)::date AND day <= d.day) AS month_days
+               FROM d LEFT JOIN rpg.day_ratings r ON r.day = d.day""").fetchone()
+        return {"day": r["day"].isoformat(), "score": r["score"], "note": r["note"],
+                "month_avg": float(r["month_avg"]) if r["month_avg"] is not None else None,
+                "month_days": int(r["month_days"])}
 
     @staticmethod
     def _training_info(conn, lo, hi) -> tuple[str, bool]:
@@ -570,6 +590,21 @@ class Api:
         after = self.character_of(conn)
         return {"done": bool(done), "xp": int(xp), "level_up": self.level_up(conn, before, after),
                 "locked": False, "character": after}
+
+    # --- POST /api/rating ---
+    def r_rating(self, conn, query, body):
+        data = self._json(body)
+        score, note = data.get("score"), data.get("note")
+        if isinstance(score, bool) or not isinstance(score, int) or not -10 <= score <= 10:
+            raise HttpError(400, "bad_request", "score: целое от -10 до +10")
+        if note is not None and (not isinstance(note, str) or len(note) > 500):
+            raise HttpError(400, "bad_request", "note: строка до 500 символов")
+        before = self.character_of(conn)
+        r = conn.execute("SELECT rpg.log_rating(%s, %s) AS r", (score, note or None)).fetchone()["r"]
+        after = self.character_of(conn)
+        return {"rating": self._rating(conn), "xp": int(r.get("xp") or 0), "milestone": r.get("milestone"),
+                "week_avg": r.get("week_avg"), "level_up": self.level_up(conn, before, after),
+                "character": after}
 
     # --- POST /api/replan ---
     def r_replan(self, conn, query, body):

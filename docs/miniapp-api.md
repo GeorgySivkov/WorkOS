@@ -30,7 +30,9 @@ Env `.env.app`: PG* роли workos_app, `TELEGRAM_BOT_ID`, `TELEGRAM_OWNER_ID`,
 {"date": "2026-10-22", "date_label": "Четверг, 22 октября", "week": 43, "now": "ISO",
  "character": {"name": "Георгий", "level": 7, "xp": 1440, "level_floor": 1400, "next_level_at": 1600},
  "summary": {"done": 1, "total": 5, "xp_today": 10},
- "habits": [{"cell_id": "A1", "title": "Сон 7,5 ч", "note": "из Garmin", "done": true, "auto": true}],
+ "habits": [{"cell_id": "A1", "title": "Сон 7,5 ч", "note": "из Garmin", "done": true, "auto": true,
+             "via": "garmin|rating|auto|null", "streak": 12}],
+ "rating": {"day": "2026-10-22", "score": 3, "note": "устал, но доволен", "month_avg": 2.4, "month_days": 12},
  "timeline": [
    {"type": "task", "...": "объект задачи"},
    {"type": "meeting", "title": "Daily Infatica", "context_id": "infatica", "color": "#4FB6C2",
@@ -54,6 +56,12 @@ Env `.env.app`: PG* роли workos_app, `TELEGRAM_BOT_ID`, `TELEGRAM_OWNER_ID`,
 - `POST /api/habits/{cell_id}/toggle` -> `{"done": true, "xp": 10, "character": {...}}`. Если привычка уже засчитана
   не вручную (задача на этой клетке, Garmin), ответ `{"done": true, "xp": 0, "locked": true}` и ничего не пишется.
   При достигнутом потолке дня отметка сохраняется с 0 опыта, серия не рвётся.
+- `POST /api/rating` `{"score": 3}` -> `{"rating": {...как в /api/today}, "xp": 10, "milestone": null,
+  "week_avg": 2.9, "level_up": false, "character": {...}}`. Ползунок «Оценка дня» на «Сегодня».
+  Пишет `rpg.log_rating` (та же функция, что `/day` в боте): оценка за логический день по часам базы,
+  повторная оценка того же дня перезаписывает число без нового опыта, заметка из `/day` сохраняется.
+  score: целое от -10 до +10, note: строка до 500 символов или нет. Иначе 400.
+  Привычка с `via: "rating"` руками не переключается (`/toggle` отвечает 400 auto), её отмечает оценка.
 - `POST /api/replan` -> то же, что `/api/today`, после пересборки несделанного с текущей минуты.
 - `GET /api/character` ->
 ```json

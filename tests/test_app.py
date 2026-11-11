@@ -235,6 +235,47 @@ def test_habit_toggle(c, admin):
     assert c.post("/api/habits/Z9/toggle").status_code == 404
 
 
+def test_rating_slider(c, admin, as_role):
+    seed_grid(admin)
+    admin.execute("""INSERT INTO rpg.cells (id, parent, title, kind, xp_base, auto_source) VALUES
+        ('A5', 'A', 'Оценка дня', 'habit', 10, 'rating:day')""")
+    day = c.get("/api/today").json()
+    rt = day["rating"]
+    assert rt["score"] is None and rt["month_days"] == 0 and rt["month_avg"] is None
+    assert rt["day"] == admin.execute("SELECT rpg.lday(now()) AS d").fetchone()["d"].isoformat()
+    habits = {h["cell_id"]: h for h in day["habits"]}
+    assert habits["A5"]["via"] == "rating" and habits["A5"]["auto"] is True and habits["A5"]["done"] is False
+    assert habits["A1"]["via"] == "garmin" and habits["A2"]["via"] is None
+    assert c.post("/api/habits/A5/toggle").status_code == 400          # руками не отмечается, только оценкой
+
+    r = c.post("/api/rating", json={"score": 4, "note": "доволен"}).json()
+    assert r["xp"] == 10 and r["milestone"] is None and r["level_up"] is False
+    assert r["rating"]["score"] == 4 and r["rating"]["note"] == "доволен" and r["rating"]["month_days"] == 1
+    assert r["character"]["xp"] == 10
+    # передумал: число меняется, опыт второй раз не идёт, заметка из /day не теряется
+    r = c.post("/api/rating", json={"score": -3}).json()
+    assert r["xp"] == 0 and r["rating"]["score"] == -3 and r["rating"]["note"] == "доволен"
+    assert r["rating"]["month_avg"] == -3.0 and r["character"]["xp"] == 10
+    day = c.get("/api/today").json()
+    assert day["rating"]["score"] == -3 and day["summary"]["xp_today"] == 10
+    assert {h["cell_id"]: h for h in day["habits"]}["A5"]["done"] is True
+    assert admin.execute("SELECT count(*) AS n FROM rpg.xp WHERE source = 'rating'").fetchone()["n"] == 1
+
+    for bad in ({}, {"score": 11}, {"score": -11}, {"score": "5"}, {"score": 2.5}, {"score": True},
+                {"score": None}, {"score": 1, "note": 5}, {"score": 1, "note": "x" * 501}):
+        assert c.post("/api/rating", json=bad).status_code == 400, bad
+    assert c.post("/api/rating", json={"score": 1}, headers={"Authorization": ""}).status_code == 401
+    assert c.get("/api/rating").status_code == 405
+    assert admin.execute("SELECT score FROM rpg.day_ratings").fetchone()["score"] == -3
+
+    # у приложения только функция: в таблицу и в журнал опыта напрямую не пишет
+    app_conn = as_role("workos_app")
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        app_conn.execute("UPDATE rpg.day_ratings SET score = 10")
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        app_conn.execute("INSERT INTO rpg.day_ratings (day, score) VALUES ('2020-01-01', 10)")
+
+
 # ---------- лента дня и пересборка ----------
 
 def test_today_timeline(c, srv, admin):

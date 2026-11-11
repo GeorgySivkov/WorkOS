@@ -302,6 +302,7 @@ EXPECT = {
         (T, "work.outbox", "SELECT", False), (T, "rpg.xp", "INSERT", False),
         (F, "rpg.log_manual(text)", "EXECUTE", True), (F, "rpg.award_task(bigint)", "EXECUTE", True),
         (F, "rpg.app_level_up(integer,integer)", "EXECUTE", True),
+        (F, "rpg.log_rating(integer,text)", "EXECUTE", True), (T, "rpg.day_ratings", "INSERT", False),
     ],
 }
 
