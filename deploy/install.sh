@@ -43,7 +43,9 @@ say "Права на код: root пишет, группа workos читает, 
 find "$APP" \( -path "$APP/certs" -o \( -path "$APP/*" ! -path "$APP/*/*" -type f \( -name '.env*' \
        -o -name '*.json' -o -name '*.key' -o -name '*.pem' -o -name '*.p12' -o -name '*.save' -o -name '*.bak' \
        -o -name '*.swp' -o -name '*~' \) \) \) -prune \
-     -o -exec chown root:workos {} + -exec chmod u+rwX,g+rX,g-w,o-rwx {} +
+     -o ! -type l -exec chown root:workos {} + -exec chmod u+rwX,g+rX,g-w,o-rwx {} +
+# ! -type l: ссылки не трогаем. chown и chmod, получив ссылку аргументом, идут по ней:
+# .venv/bin/python ведёт в /usr/bin/python3.12, и системный Python становился root:workos 750
 
 say "Файлы окружения: каждый читает только свой пользователь"
 for pair in reader:workos-reader bot:workos-bot executor:workos-exec app:workos-app; do

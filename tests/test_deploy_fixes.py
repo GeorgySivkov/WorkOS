@@ -176,3 +176,22 @@ def test_google_auth_is_stdlib_only():
     tok = mod.exchange({"client_id": "cid", "client_secret": "sec"}, "CODE", "http://127.0.0.1:8765/", opener)
     assert tok["refresh_token"] == "1//abc" and seen["url"] == "https://oauth2.googleapis.com/token"
     assert "code=CODE" in seen["body"] and "grant_type=authorization_code" in seen["body"]
+
+
+def test_install_group_chmod_does_not_follow_symlinks(tmp_path):
+    """Раздача прав на код не идёт по ссылкам наружу: .venv/bin/python ведёт в /usr/bin/python3.12,
+    и прежний find делал системный Python root:workos 750 (Unrote падал с 203/EXEC)."""
+    text = (DEPLOY / "install.sh").read_text(encoding="utf-8")
+    start = text.index('say "Права на код')
+    block = text[text.index("\n", start) + 1:text.index("\nsay ", start)]
+    app, outside = tmp_path / "app", tmp_path / "usr_bin_python"
+    (app / ".venv" / "bin").mkdir(parents=True)
+    outside.write_text("#!/bin/sh\n")
+    outside.chmod(0o755)
+    (app / ".venv" / "bin" / "python").symlink_to(outside)
+    (app / "main.py").write_text("x = 1\n")
+    me = f"{os.getuid()}:{os.getgid()}"
+    script = f'APP="{app}"\n' + block.replace("root:workos", me)
+    subprocess.run(["bash", "-euc", script], check=True)
+    assert outside.stat().st_mode & 0o777 == 0o755
+    assert (app / "main.py").stat().st_mode & 0o007 == 0          # свои файлы закрыты от остальных
