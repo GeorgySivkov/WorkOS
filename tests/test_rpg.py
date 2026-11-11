@@ -204,3 +204,47 @@ def test_garmin_activity_type_alternatives():
     assert garmin.met(rule, d, acts, {}, None)
     acts = {d: [{"type": "walking", "minutes": 75}]}
     assert not garmin.met(rule, d, acts, {}, None)
+
+
+def test_garmin_login_saves_tokens_and_reuses_them(tmp_path, monkeypatch):
+    """garminconnect 0.3: токены пишет login(store), атрибута garth больше нет.
+    Прежний код звал garth.dump и молча глотал ошибку: вход «ok», а токенов нет."""
+    import json
+    import sys
+    import types
+    from pathlib import Path
+
+    from rpg import garmin as g
+
+    calls = []
+
+    class Garmin:                       # повторяет поведение garminconnect 0.3.20
+        def __init__(self, email=None, password=None, prompt_mfa=None, **_):
+            self.email, self.password = email, password
+
+        def login(self, tokenstore=None):
+            f = Path(tokenstore) / "garmin_tokens.json"
+            if f.exists():
+                calls.append("tokens")
+                return None, None
+            if not (self.email and self.password):
+                raise RuntimeError("Username and password are required")
+            calls.append("password")
+            f.write_text(json.dumps({"di_token": "t"}))
+            return None, None
+
+    monkeypatch.setitem(sys.modules, "garminconnect", types.SimpleNamespace(Garmin=Garmin))
+    store = tmp_path / "gc"
+    monkeypatch.setenv("GARMIN_TOKENS", str(store))
+    monkeypatch.delenv("GARMIN_EMAIL", raising=False)
+    monkeypatch.delenv("GARMIN_PASSWORD", raising=False)
+    with pytest.raises(g.GarminUnavailable):
+        g.GarminClient._login()                       # ни токенов, ни пароля
+    monkeypatch.setenv("GARMIN_EMAIL", "me@example.com")
+    monkeypatch.setenv("GARMIN_PASSWORD", "pw")
+    assert g.login() == {"ok": True, "tokens": str(store)}
+    assert (store / "garmin_tokens.json").exists() and calls == ["password"]
+    monkeypatch.delenv("GARMIN_EMAIL")
+    monkeypatch.delenv("GARMIN_PASSWORD")
+    g.GarminClient._login()                           # ежечасный прогон: только токены
+    assert calls == ["password", "tokens"]

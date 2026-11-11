@@ -11,8 +11,9 @@
 привычка +10% за каждый день серии до +50%, потолок 100 в день на характеристику.
 Потолок срезает опыт, а не факт: упёрлись в него, запись пишется с нулём, и серия не рвётся.
 
-Вход в Garmin: токены garth в GARMIN_TOKENS (по умолчанию ~/.garminconnect пользователя
-workos-reader). Один раз: `workctl garmin-login` с GARMIN_EMAIL и GARMIN_PASSWORD в .env.reader.
+Вход в Garmin (garminconnect 0.3): токены в GARMIN_TOKENS/garmin_tokens.json (каталог по умолчанию
+~/.garminconnect пользователя workos-reader). Один раз: `workctl garmin-login` с GARMIN_EMAIL и
+GARMIN_PASSWORD в окружении. Дальше библиотека сама обновляет токены в том же файле.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from pathlib import Path
 from core import config, db, timeutil as tu
 
 ACTIVITY_MIN_MINUTES = 20
+TOKEN_FILE = "garmin_tokens.json"   # имя файла токенов в garminconnect 0.3
 
 
 class GarminUnavailable(RuntimeError):
@@ -46,7 +48,8 @@ class GarminClient:
         except ImportError as e:
             raise GarminUnavailable("garminconnect не установлен: pip install garminconnect") from e
         store = cls.tokenstore()
-        if not interactive and Path(store).exists():
+        tokens = Path(store) / TOKEN_FILE
+        if not interactive and tokens.exists():
             try:
                 api = Garmin()
                 api.login(store)
@@ -55,18 +58,14 @@ class GarminClient:
                 pass
         email, password = config.env("GARMIN_EMAIL"), config.env("GARMIN_PASSWORD")
         if not (email and password):
-            raise GarminUnavailable(f"нет токенов в {store} и не заданы GARMIN_EMAIL/GARMIN_PASSWORD")
+            raise GarminUnavailable(f"нет токенов в {tokens} и не заданы GARMIN_EMAIL/GARMIN_PASSWORD")
         kw = {"prompt_mfa": lambda: input("Код MFA Garmin: ")} if interactive else {}
-        try:
-            api = Garmin(email, password, **kw)
-        except TypeError:
-            api = Garmin(email, password)
-        api.login()
-        try:
-            Path(store).mkdir(parents=True, exist_ok=True)
-            api.garth.dump(store)
-        except Exception:  # noqa: BLE001
-            pass
+        api = Garmin(email, password, **kw)
+        Path(store).mkdir(mode=0o700, parents=True, exist_ok=True)
+        # garminconnect 0.3: login(store) входит паролем и сам пишет store/garmin_tokens.json (0600)
+        api.login(store)
+        if not tokens.exists():
+            raise GarminUnavailable(f"вход прошёл, но токены не записались в {tokens}")
         return api
 
     # ---- данные за календарные дни ----

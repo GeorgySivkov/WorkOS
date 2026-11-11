@@ -1,2 +1,2 @@
 # Garmin как источник опыта (П.4): .venv/bin/pip install -r requirements-optional.txt
-garminconnect>=0.2.19
+garminconnect>=0.3,<0.4
