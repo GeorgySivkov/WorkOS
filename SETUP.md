@@ -27,7 +27,7 @@ cd /opt/workos && git fetch && git checkout build/all-phases && git pull
 apt-get update && apt-get install -y python3-venv     # остальное (ffmpeg, age, клиент Postgres) ставит install.sh
 cp deploy/env/admin.example .env.admin && nano .env.admin   # doadmin + пароли новых ролей
 bash deploy/install.sh                                 # пользователи, права, пакеты, своп, venv, systemd
-WORKOS_ROLE=admin .venv/bin/python migrate.py          # миграции 002-010
+WORKOS_ROLE=admin .venv/bin/python migrate.py          # миграции 002-011
 WORKOS_ROLE=admin .venv/bin/python migrate.py --status # всё с галочками
 ```
 `migrate.py` сам увидит, что схема из шага 0.3 уже стоит, и не будет её трогать.
@@ -103,20 +103,22 @@ done
 
 ## Персонаж
 
-1. Заполни сетку на странице «Мандарат» (центр, 8 направлений, практики с типом).
-   Скажи Claude, что заполнил: он выгрузит JSON. Дальше на дроплете:
+1. Сетка заполнена 11.11: полный JSON с источниками Garmin, оценкой дня и наградами лежит в проекте
+   PersonalOS как `claude/mandarat.json`. Скачай его, положи на дроплет в `/opt/workos/mandarat.json` и засей:
    ```bash
-   WORKOS_ROLE=admin .venv/bin/python workctl.py seed-grid mandarat.json \
-       --reward character:8="вещь из хотелок" --reward character:10="ещё одна"
+   WORKOS_ROLE=admin .venv/bin/python workctl.py seed-grid mandarat.json
    ```
    Повторный запуск безопасен: клетки обновятся, убранные станут неактивными, опыт не пропадёт.
+   Награды и источники уже внутри JSON, флаги `--auto` и `--reward` нужны, только чтобы что-то поменять.
 2. **Garmin (П.4):** `WITH_GARMIN=1 bash deploy/install.sh`. Впиши в `.env.reader` на время входа
    `GARMIN_EMAIL=...` и `GARMIN_PASSWORD=...` (строки есть в `deploy/env/reader.example`), затем один раз
    `sudo -u workos-reader WORKOS_ROLE=reader .venv/bin/python workctl.py garmin-login`
    (если включена MFA, он спросит код). Токены лягут в `GARMIN_TOKENS`, после этого пароль из `.env.reader` сотри.
-   Привяжи клетки: `seed-grid mandarat.json --auto A1=garmin:sleep:7.5 --auto A2=garmin:activity`.
-3. `bash deploy/phase.sh persona`
-4. **Готово, когда:** отметка задачи в мини-приложении дала опыт, `/me` в теме «План» показывает те же цифры,
+   Клетки уже привязаны в JSON (сон, шаги, силовые, сноуборд, хайкинг, велосипед, прогулки).
+3. **Оценка дня:** `/day +3 заметка` в боте, а после 00:30 бот сам спросит «Как прошёл день?» с кнопками.
+   Привычка «Оценка дня» и этап «Месяц со средней оценкой +3» засчитываются сами.
+4. `bash deploy/phase.sh persona`
+5. **Готово, когда:** отметка задачи в мини-приложении дала опыт, `/me` в теме «План» показывает те же цифры,
    первое повышение уровня пришло сообщением.
 
 ---
@@ -271,7 +273,7 @@ sudo -u workos-reader WORKOS_ROLE=reader .venv/bin/python workctl.py status
   (`journalctl -u 'workos@*' --since -1h`).
 
 ## Что проверено, а что нет
-- 258 автотестов на локальном Postgres (`python3 -m pytest -q`): права ролей, захват, карточки и хеш одобрения,
+- 266 автотестов на локальном Postgres (`python3 -m pytest -q`): права ролей, захват, карточки и хеш одобрения,
   мини-приложение, расстановка дня (включая переход часов 25.10), опыт, коллекторы и исполнители на поддельных API,
   разрешение имён, потолок попыток модели, настоящий `backup.sh` и `restore_check.sh` против тестовой базы.
 - `install.sh` (PGDG, своп, права) и юниты systemd проверены только статически: первый прогон на дроплете

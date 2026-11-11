@@ -284,6 +284,7 @@ EXPECT = {
         (C, "work.tasks.planned_start", "UPDATE", True),
         (T, "rpg.xp", "INSERT", False), (T, "work.calendar_feed", "SELECT", True),
         (C, "work.actions.shown_hash", "UPDATE", True), (C, "work.autonomy.auto_count", "UPDATE", True),
+        (F, "rpg.log_rating(integer,text)", "EXECUTE", True),
     ],
     "workos_exec": [
         (T, "work.events", "SELECT", False), (T, "work.calendar_feed", "SELECT", True),

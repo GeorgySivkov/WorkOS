@@ -50,6 +50,10 @@ def sheet(conn) -> str:
     rusty = [a["title"] for a in attrs if a["rusty"]]
     if rusty:
         lines.append("Заржавели (14 дней без опыта): " + esc(", ".join(rusty)))
+    from bot import rating
+    rl = rating.month_line(conn)
+    if rl:
+        lines.append(rl)
     st = streaks(conn)
     if st:
         lines.append("Серии: " + " · ".join(f"{esc(t)} {n} {plural(n, 'день', 'дня', 'дней')}" for t, n in st[:6]))

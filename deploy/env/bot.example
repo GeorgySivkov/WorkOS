@@ -17,3 +17,5 @@ WHISPER_MODEL=/opt/whisper.cpp/models/ggml-base-q5_1.bin
 # 1 только на дроплете от 2 ГБ
 WORKOS_ASK_VECTOR=0
 WORKOS_SELF_NAMES=Георгий,Жора,Гоша,George
+# вопрос «Как прошёл день?» с кнопками оценки (после тренировки); off = не спрашивать
+WORKOS_RATING_ASK=00:30

@@ -201,7 +201,7 @@ def test_topics_created_and_stored(tg, role_env, admin, monkeypatch, clock):
     assert set(rows) == set(config.TOPICS) and all(rows.values())
     menu = tg.last("setChatMenuButton")["menu_button"]
     assert menu["type"] == "web_app" and menu["text"] == "Квесты" and menu["web_app"]["url"] == "https://app.test/"
-    assert {c["command"] for c in tg.last("setMyCommands")["commands"]} == {"me", "plan", "manual", "auto", "help"}
+    assert {c["command"] for c in tg.last("setMyCommands")["commands"]} == {"me", "plan", "day", "manual", "auto", "help"}
     # второй старт ничего не создаёт заново
     tg.reset()
     t2 = Terminal(bot=bot, ctx=Ctx(bot, owner=OWNER))

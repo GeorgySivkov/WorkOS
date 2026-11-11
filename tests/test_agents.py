@@ -501,7 +501,7 @@ def test_sprint_report_from_db(admin, reader, capsys):
                   "source_event) VALUES ('infatica', now() - interval '3 days', 'Релиз SDK 2.0 в ноябре', "
                   "'партнёры ждут', %s::jsonb, %s)", (json.dumps([yan]), mt))
     admin.execute("INSERT INTO work.commitments (context_id, direction, person_id, what, due, status, closed_at) "
-                  "VALUES ('infatica', 'theirs', %s, 'выгрузка логов', current_date - 1, 'open', NULL), "
+                  "VALUES ('infatica', 'theirs', %s, 'выгрузка логов', current_date - 3, 'open', NULL), "
                   "('infatica', 'mine', %s, 'методология', NULL, 'done', now() - interval '1 day')", (yan, yan))
     admin.execute("INSERT INTO work.actions (context_id, type, payload, status, executed_at) VALUES "
                   "('infatica', 'trello_card', '{\"name\": \"Build SDK dashboard\"}', 'executed', now())")

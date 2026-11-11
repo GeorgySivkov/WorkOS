@@ -316,7 +316,8 @@ class Api:
             n = streak(facts.get(r["id"], {}).get("days", set()), today)
             src = r["auto_source"]
             if src:
-                note = "из Garmin" if src.startswith("garmin") else "сама"
+                note = ("из Garmin" if src.startswith("garmin")
+                        else "через /day в боте" if src.startswith("rating") else "сама")
             elif n:
                 note = f"серия {n}"
             else:

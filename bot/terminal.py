@@ -23,7 +23,7 @@ import httpx
 from core import config, timeutil as tu
 from core.tg import Bot, TgError, btn, esc, scrub
 
-from bot import ask, candidates, capture, cards, domains, me, plancard, topics, voice
+from bot import ask, candidates, capture, cards, domains, me, plancard, rating, topics, voice
 from bot.topics import Ctx, short_date, web_app_button
 
 log = logging.getLogger("workos.bot")
@@ -39,6 +39,7 @@ CONTENT = ("text", "photo", "voice", "audio", "video_note", "document", "video",
 COMMANDS = [
     {"command": "me", "description": "Лист персонажа"},
     {"command": "plan", "description": "План на сегодня"},
+    {"command": "day", "description": "Оценка дня от -10 до +10"},
     {"command": "manual", "description": "Все действия на подтверждение"},
     {"command": "auto", "description": "Снять блокировку автономии"},
     {"command": "help", "description": "Что где"},
@@ -47,6 +48,7 @@ HELP = (
     "<b>Как со мной работать</b>\n"
     "«Входящие»: кидай всё подряд, текст, голос, фото, пересланное. Задача с датой сразу уходит в список.\n"
     "«План»: вставь секцию «Завтра» из вечернего плана, соберу карточку. /me: лист персонажа, /plan: день.\n"
+    "/day +3 заметка: оценка дня от -10 до +10, после 00:30 спрошу сам.\n"
     "«Решения»: карточки действий, одно нажатие на решение.\n"
     "«Спросить»: вопрос к памяти.\n"
     "/manual: всё на подтверждение и запереть автономию · /auto: снять блокировку."
@@ -367,6 +369,8 @@ class Terminal:
             ctx.reply(msg, me.sheet(ctx.conn))
         elif cmd == "plan":
             ctx.reply(msg, plan_text(ctx.conn), [[wa]] if wa else None)
+        elif cmd == "day":
+            rating.handle_command(ctx, msg, text)
         elif cmd == "manual":
             ctx.reply(msg, cards.manual(ctx))
         elif cmd == "auto":
@@ -387,7 +391,7 @@ class Terminal:
         handlers = {
             "cap": capture.on_callback, "pb": plancard.on_callback, "act": cards.on_callback,
             "rb": cards.on_rollback, "idc": candidates.on_callback, "ask": ask.on_callback,
-            "tk": on_task_button,
+            "tk": on_task_button, "rt": rating.on_callback,
         }
         answer = None
         try:
@@ -436,6 +440,7 @@ class Terminal:
         out = {"cards": self._safe(ctx, "cards", cards.process_proposed, ctx)}
         if self._due("remind", REMIND_EVERY, force):
             out["reminders"] = self._safe(ctx, "reminders", reminders, ctx)
+            out["rating_ask"] = self._safe(ctx, "rating", rating.ask, ctx)
         out["outbox"] = self._safe(ctx, "outbox", flush_outbox, ctx)
         if self._due("health", HEALTH_EVERY, force):
             health_ping()

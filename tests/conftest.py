@@ -88,7 +88,7 @@ def clean(admin):
     admin.execute("""TRUNCATE work.outbox, work.outcomes, work.tasks, work.actions, work.events,
                      work.identity_candidates, work.decisions, work.commitments, work.identities,
                      work.person_contexts, work.people, work.notices, work.autonomy, work.bot_topics,
-                     rpg.xp, rpg.level_marks, rpg.achievements, rpg.rewards RESTART IDENTITY CASCADE""")
+                     rpg.xp, rpg.level_marks, rpg.achievements, rpg.rewards, rpg.day_ratings RESTART IDENTITY CASCADE""")
     admin.execute("DELETE FROM rpg.cells WHERE parent IS NOT NULL")
     admin.execute("DELETE FROM rpg.cells")
     admin.execute("UPDATE work.sources SET watermark = NULL, last_ok_at = NULL, last_error = NULL")
