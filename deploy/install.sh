@@ -38,6 +38,9 @@ for u in workos-reader workos-exec workos-bot workos-app; do usermod -aG workos 
 for u in workos-reader workos-bot; do
   for d in .claude .cache .config; do install -d -m 700 -o "$u" -g "$u" "/var/lib/$u/$d"; done
 done
+# Plaud: файл токенов, который коллектор сам перезаписывает при обновлении
+install -d -m 700 -o workos-reader -g workos-reader /var/lib/workos-reader/.plaud
+[ -f /var/lib/workos-reader/.plaud/tokens.json ] && { chown workos-reader:workos-reader /var/lib/workos-reader/.plaud/tokens.json; chmod 600 /var/lib/workos-reader/.plaud/tokens.json; }
 
 say "Права на код: root пишет, группа workos читает, остальные никто (секреты и certs/ не трогаем)"
 find "$APP" \( -path "$APP/certs" -o \( -path "$APP/*" ! -path "$APP/*/*" -type f \( -name '.env*' \

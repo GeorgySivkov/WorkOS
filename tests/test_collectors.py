@@ -131,9 +131,79 @@ def test_trello_cards_and_mirror(admin, mk_source, role_env, monkeypatch):
 
 
 # ---------------- Plaud ----------------
-def test_plaud_transcript_ready_and_calendar_match(admin, mk_source, role_env, monkeypatch):
+PLAUD_BASE = "https://platform.plaud.ai/developer/api"
+
+
+def plaud_tokens(tmp_path, monkeypatch, expires_in_ms: int = 3_600_000, **extra) -> Path:
+    import time as _t
+    f = tmp_path / "tokens.json"
+    f.write_text(json.dumps({"access_token": "acc-1", "refresh_token": "ref-1", "token_type": "Bearer",
+                             "expires_at": int(_t.time() * 1000) + expires_in_ms, **extra}))
+    monkeypatch.setenv("PLAUD_TOKENS_FILE", str(f))
+    monkeypatch.delenv("PLAUD_PLATFORM_BASE", raising=False)
+    return f
+
+
+class FakePlaud:
+    """Официальный API Plaud: список страницами, запись с source_list/note_list, обновление токена."""
+
+    def __init__(self, recs: dict, texts: dict, summaries: dict | None = None, links: bool = False):
+        self.recs, self.texts, self.summaries, self.links = recs, texts, summaries or {}, links
+        self.pages: list[int] = []
+        self.files: list[str] = []
+        self.blob_auth: list[str | None] = []
+        self.refreshed: list[str] = []
+        self.token = "acc-1"
+
+    def block(self, kind: str, content: str, key: str) -> dict:
+        if self.links:
+            return {"data_type": kind, "data_link": f"https://s3.example.com/{key}"}
+        return {"data_type": kind, "data_content": content}
+
+    def __call__(self, req: httpx.Request) -> httpx.Response:
+        if req.url.host == "s3.example.com":
+            self.blob_auth.append(req.headers.get("Authorization"))
+            key = req.url.path.strip("/")
+            kind, fid = key.split("-", 1)
+            body = json.dumps(self.texts[fid]) if kind == "t" else self.summaries[fid]
+            return httpx.Response(200, text=body)
+        path = req.url.path.removeprefix("/developer/api")
+        if path == "/oauth/third-party/access-token/refresh":
+            rt = parse_qs(req.content.decode())["refresh_token"][0]
+            self.refreshed.append(rt)
+            if rt != "ref-1" and rt != "ref-2":
+                return httpx.Response(401, json={"detail": "bad"})
+            self.token = f"acc-{len(self.refreshed) + 1}"
+            return httpx.Response(200, json={"access_token": self.token, "refresh_token": "ref-2",
+                                             "token_type": "bearer", "expires_in": 86400})
+        if req.headers.get("Authorization") != f"Bearer {self.token}":
+            return httpx.Response(401)
+        if path == "/open/third-party/files/":
+            page, size = int(req.url.params["page"]), int(req.url.params["page_size"])
+            self.pages.append(page)
+            lst = sorted(self.recs.values(), key=lambda r: r["start_at"], reverse=True)
+            return httpx.Response(200, json={"data": lst[(page - 1) * size: page * size], "page": page})
+        if path.startswith("/open/third-party/files/"):
+            fid = path.rsplit("/", 1)[1]
+            self.files.append(fid)
+            if fid not in self.recs:
+                return httpx.Response(404)
+            src = [self.block("transaction", json.dumps(self.texts[fid]), f"t-{fid}")] if fid in self.texts else []
+            notes = [self.block("auto_sum_note", self.summaries[fid], f"s-{fid}")] if fid in self.summaries else []
+            return httpx.Response(200, json={**self.recs[fid], "source_list": src, "note_list": notes})
+        if path == "/open/third-party/users/current":
+            return httpx.Response(200, json={"id": "u1", "email": "x@y"})
+        return httpx.Response(404)
+
+
+def naive_utc(dt: datetime) -> str:
+    """Как Plaud отдаёт время: ISO без пояса, в UTC."""
+    return dt.astimezone(UTC).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def test_plaud_transcript_ready_and_calendar_match(admin, mk_source, role_env, monkeypatch, tmp_path):
     from collectors.plaud import PlaudCollector
-    monkeypatch.setenv("PLAUD_TOKEN", "bearer secret-token")
+    plaud_tokens(tmp_path, monkeypatch)
     role_env("workos_reader")
     now = tu.now()
     t_meet = (now - timedelta(hours=3)).replace(microsecond=0)
@@ -148,142 +218,145 @@ def test_plaud_transcript_ready_and_calendar_match(admin, mk_source, role_env, m
     ).fetchone()["id"]
 
     recs = {
-        "solo": {"id": "solo", "filename": "Заметка", "start_time": int(t_solo.timestamp() * 1000),
-                 "duration": 120000, "is_trans": 0},
-        "meet": {"id": "meet", "filename": "SDK sync", "start_time": int(t_meet.timestamp() * 1000),
-                 "duration": 3000000, "is_trans": 1},
-        "old": {"id": "old", "filename": "Давно", "start_time": int((now - timedelta(days=9)).timestamp() * 1000),
-                "duration": 1000, "is_trans": 1},
+        "of_solo": {"id": "of_solo", "name": "Заметка", "start_at": naive_utc(t_solo), "duration": 120000},
+        "of_meet": {"id": "of_meet", "name": "SDK sync", "start_at": naive_utc(t_meet), "duration": 3000000},
+        "of_old": {"id": "of_old", "name": "Давно", "start_at": naive_utc(now - timedelta(days=9)), "duration": 1000},
     }
-    details = {
-        "meet": {"id": "meet", "trans_result": [
-            {"speaker": "Ян", "content": "Привет.", "start_time": 0, "end_time": 1000},
-            {"speaker": "Ян", "content": "Начнём.", "start_time": 1000, "end_time": 2000},
-            {"speaker": "George", "content": "Давай.", "start_time": 2000, "end_time": 3000}],
-            "ai_content": json.dumps({"markdown": "# Итоги\nрешили выпускать"})},
-        "solo": {"id": "solo", "trans_result": [{"speaker": "", "content": "Купить корм", "start_time": 0}]},
-    }
-    asked: list[list[str]] = []
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        assert req.headers["Authorization"] == "bearer secret-token"
-        if req.url.path == "/file/simple/web":
-            lst = sorted(recs.values(), key=lambda r: -r["start_time"])
-            return httpx.Response(200, json={"status": 0, "data_file_list": lst})
-        if req.url.path == "/file/list" and req.method == "POST":
-            ids = json.loads(req.content)
-            asked.append(ids)
-            return httpx.Response(200, json={"data_file_list": [{**recs[i], **details[i]} for i in ids]})
-        return httpx.Response(404)
-
-    t = httpx.MockTransport(handler)
+    texts = {"of_meet": [
+        {"speaker": "Ян", "content": "Привет.", "start_time": 0, "end_time": 1000},
+        {"speaker": "Ян", "content": "Начнём.", "start_time": 1000, "end_time": 2000},
+        {"speaker": "George", "content": "Давай.", "start_time": 2000, "end_time": 3000}]}
+    fake = FakePlaud(recs, texts, {"of_meet": "# Итоги\nрешили выпускать"}, links=True)
+    t = httpx.MockTransport(fake)
     s = mk_source("plaud:test", "plaud", None, lookback=3)
     r1 = run_source("plaud:test", PlaudCollector(s, transport=t))
-    assert r1["inserted"] == 1 and asked == [["meet"]]       # не готовый транскрипт даже не запрашиваем
+    assert r1["inserted"] == 1 and "of_old" not in fake.files
+    assert fake.blob_auth and set(fake.blob_auth) == {None}          # наш токен в хранилище не уходит
     ev = events(admin, "plaud:test")[0]
-    assert ev["kind"] == "meeting" and ev["external_id"] == "meet" and ev["title"] == "SDK sync"
+    assert ev["kind"] == "meeting" and ev["external_id"] == "of_meet" and ev["title"] == "SDK sync"
     assert ev["body"] == "Ян: Привет. Начнём.\nGeorge: Давай."
     assert ev["context_id"] == "infatica"
     assert ev["meta"]["calendar_event_id"] == cal_id and ev["meta"]["personal"] is False
     assert ev["meta"]["speakers"] == ["Ян", "George"] and ev["meta"]["segments_count"] == 3
     assert ev["meta"]["summary"].startswith("# Итоги") and ev["meta"]["participant_ids"] == []
     assert ev["occurred_at"] == t_meet
+    st = json.loads(src(admin, "plaud:test")["watermark"])
+    assert set(st["pending"]) == {"of_solo"}
 
     # сведение людей проставило участников; транскрипт второй записи дозрел к следующему прогону
-    admin.execute("UPDATE work.events SET meta = meta || '{\"participant_ids\": [7]}' WHERE external_id = 'meet'")
-    recs["solo"]["is_trans"] = 1
+    admin.execute("UPDATE work.events SET meta = meta || '{\"participant_ids\": [7]}' WHERE external_id = 'of_meet'")
+    texts["of_solo"] = [{"speaker": "", "content": "Купить корм", "start_time": 0}]
     r2 = run_source("plaud:test", PlaudCollector(src(admin, "plaud:test"), transport=t))
     assert r2["inserted"] == 1
     rows = {e["external_id"]: e for e in events(admin, "plaud:test")}
-    assert rows["meet"]["meta"]["participant_ids"] == [7]
-    solo = rows["solo"]
+    assert rows["of_meet"]["meta"]["participant_ids"] == [7]
+    solo = rows["of_solo"]
     assert solo["context_id"] == "personal" and solo["meta"]["personal"] is True
     assert solo["meta"]["calendar_event_id"] is None and solo["body"] == "Спикер: Купить корм"
-    assert "old" not in rows
+    assert "of_old" not in rows
 
 
-def test_plaud_late_upload_and_late_transcript(admin, mk_source, role_env, monkeypatch):
+def test_plaud_late_upload_and_late_transcript(admin, mk_source, role_env, monkeypatch, tmp_path):
     """Запись старше метки не теряется: транскрипт дозрел позже (pending) или файл залили поздно."""
     from collectors.plaud import PlaudCollector
-    monkeypatch.setenv("PLAUD_TOKEN", "tok")
+    plaud_tokens(tmp_path, monkeypatch)
     role_env("workos_reader")
     now = tu.now()
 
-    def ms(delta: timedelta) -> int:
-        return int((now - delta).timestamp() * 1000)
+    def at(delta: timedelta) -> str:
+        return naive_utc(now - delta)
 
     recs = {
-        "a": {"id": "a", "filename": "A", "start_time": ms(timedelta(hours=1)), "duration": 1000, "is_trans": 1},
-        "b": {"id": "b", "filename": "B", "start_time": ms(timedelta(hours=2)), "duration": 1000, "is_trans": 0},
-        "c": {"id": "c", "filename": "C", "start_time": ms(timedelta(hours=30)), "duration": 1000, "is_trans": 1},
-        "old": {"id": "old", "filename": "Давно", "start_time": ms(timedelta(days=10)), "duration": 1000,
-                "is_trans": 1},
+        "a": {"id": "a", "name": "A", "start_at": at(timedelta(hours=1)), "duration": 1000},
+        "b": {"id": "b", "name": "B", "start_at": at(timedelta(hours=2)), "duration": 1000},
+        "c": {"id": "c", "name": "C", "start_at": at(timedelta(hours=30)), "duration": 1000},
+        "old": {"id": "old", "name": "Давно", "start_at": at(timedelta(days=10)), "duration": 1000},
     }
-    texts = {"a": "первая", "b": "вторая", "old": "старая"}       # у «c» флаг есть, а текста ещё нет
-    lists: list[int] = []
-    asked: list[list[str]] = []
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        if req.url.path == "/file/simple/web":
-            skip, limit = int(req.url.params["skip"]), int(req.url.params["limit"])
-            lists.append(skip)
-            lst = sorted(recs.values(), key=lambda r: -r["start_time"])[skip:skip + limit]
-            return httpx.Response(200, json={"data_file_list": lst})
-        ids = json.loads(req.content)
-        asked.append(ids)
-        out = [{**recs[i], "trans_result": [{"speaker": "Я", "content": texts[i]}] if i in texts else []}
-               for i in ids if i in recs]
-        return httpx.Response(200, json={"data_file_list": out})
-
-    t = httpx.MockTransport(handler)
+    texts = {"a": [{"speaker": "Я", "content": "первая"}], "old": [{"speaker": "Я", "content": "старая"}],
+             "c": []}                                     # у «c» блок есть, а текста ещё нет
+    fake = FakePlaud(recs, texts)
+    t = httpx.MockTransport(fake)
     s = mk_source("plaud:late", "plaud", None, {"page_size": 2}, lookback=0)
-    # прогон 1: «a» готова, «b» без транскрипта (ждём), «c» с флагом, но без текста (ждём), «old» до WorkOS
+    # прогон 1: «a» готова, «b» и «c» без текста (ждём), «old» до WorkOS
     r1 = run_source("plaud:late", PlaudCollector(s, transport=t))
     assert r1["inserted"] == 1
     st = json.loads(src(admin, "plaud:late")["watermark"])
     assert set(st["pending"]) == {"b", "c"} and st["floor"]
-    assert "b" not in asked[0]                                    # свежий «нет транскрипта» не перепроверяем
 
-    # прогон 2 (обычный): метка = начало прогона 1, все записи уже старше неё.
-    # «b» дозрела, у «c» появился текст: оба из pending, хоть и старше метки.
+    # прогон 2 (обычный): «b» и «c» дозрели, обе из pending, хоть и старше метки.
     # «d» залили с телефона поздно (запись суточной давности), она за учтённой страницей
-    recs["b"]["is_trans"] = 1
-    texts["c"] = "третья"
-    recs["d"] = {"id": "d", "filename": "D", "start_time": ms(timedelta(hours=26)), "duration": 1000, "is_trans": 1}
-    texts["d"] = "поздняя"
-    lists.clear()
+    texts["b"] = [{"speaker": "Я", "content": "вторая"}]
+    texts["c"] = [{"speaker": "Я", "content": "третья"}]
+    recs["d"] = {"id": "d", "name": "D", "start_at": at(timedelta(hours=26)), "duration": 1000}
+    texts["d"] = [{"speaker": "Я", "content": "поздняя"}]
+    fake.pages.clear()
     run_source("plaud:late", PlaudCollector(src(admin, "plaud:late"), transport=t))
     got = {e["external_id"]: e for e in events(admin, "plaud:late")}
     assert set(got) == {"a", "b", "c"} and got["c"]["body"] == "Я: третья"
-    assert lists == [0]                                           # первая страница учтена целиком
-    st = json.loads(src(admin, "plaud:late")["watermark"])
-    assert st["pending"] == {}
+    assert fake.pages == [1]                                      # первая страница учтена целиком
+    assert json.loads(src(admin, "plaud:late")["watermark"])["pending"] == {}
 
     # прогон 3 (глубокий, раз в час): листаем до 30 дней назад и находим позднюю загрузку
     wm = json.loads(src(admin, "plaud:late")["watermark"])
     wm["scanned_at"] = (now - timedelta(hours=2)).isoformat()
     admin.execute("UPDATE work.sources SET watermark = %s WHERE id = 'plaud:late'", (json.dumps(wm),))
-    lists.clear()
+    fake.pages.clear()
     run_source("plaud:late", PlaudCollector(src(admin, "plaud:late"), transport=t))
     got = {e["external_id"]: e for e in events(admin, "plaud:late")}
     assert set(got) == {"a", "b", "c", "d"} and got["d"]["body"] == "Я: поздняя"
     assert "old" not in got                                       # до первого прогона: не тянем
-    assert lists == [0, 2, 4]
+    assert fake.pages == [1, 2, 3]
 
     # прогон 4: всё учтено, первая же страница старше метки и известна: дальше не листаем
-    lists.clear()
-    asked.clear()
+    fake.pages.clear()
+    fake.files.clear()
     r4 = run_source("plaud:late", PlaudCollector(src(admin, "plaud:late"), transport=t))
-    assert r4["inserted"] == 0 and lists == [0] and asked == []
+    assert r4["inserted"] == 0 and fake.pages == [1] and fake.files == []
 
     # срок ожидания: запись без транскрипта старше 30 дней из pending выпадает
-    from collectors.plaud import PlaudCollector as PC
     stale = dict(src(admin, "plaud:late"))
     stale["watermark"] = json.dumps({"cursor": now.isoformat(), "floor": (now - timedelta(days=40)).isoformat(),
                                      "pending": {"ghost": (now - timedelta(days=31)).isoformat()}})
-    col = PC(stale, transport=t)
+    col = PlaudCollector(stale, transport=t)
     col.collect()
     assert col.state["pending"] == {}
+
+
+def test_plaud_token_refresh_and_relogin(tmp_path, monkeypatch):
+    """Истёкший access-токен обновляется сам, файл перезаписывается (600); отозванный вход даёт понятную ошибку."""
+    import os
+    from collectors.plaud import PlaudAuthError, make_api, probe
+    f = plaud_tokens(tmp_path, monkeypatch, expires_in_ms=-1000)
+    fake = FakePlaud({"x": {"id": "x", "name": "X", "start_at": "2026-11-20T10:00:00", "duration": 5}},
+                     {"x": [{"speaker": "Я", "content": "текст"}]}, {"x": "сводка"})
+    t = httpx.MockTransport(fake)
+    api = make_api(transport=t)
+    assert [r["id"] for r in api.list_recordings(0, 50)] == ["x"]
+    assert fake.refreshed == ["ref-1"]
+    saved = json.loads(f.read_text())
+    assert saved["access_token"] == "acc-2" and saved["refresh_token"] == "ref-2" and saved["expires_at"] > 0
+    assert oct(os.stat(f).st_mode & 0o777) == "0o600"
+    assert api.started_at({"start_at": "2026-11-20T10:00:00"}) == datetime(2026, 11, 20, 10, tzinfo=UTC)
+
+    # сервер отозвал токен раньше срока: одна попытка обновиться и повтор запроса
+    fake.token = "acc-server-side"
+    fake.refreshed.clear()
+    api2 = make_api(transport=t)
+    assert api2.get_file("x")["id"] == "x" and fake.refreshed == ["ref-2"]
+
+    # probe: только форма, без текстов
+    out = probe(transport=t)
+    assert out["list_count"] == 1 and out["source_types"] == ["transaction"] and out["segments"] == 1
+    assert "текст" not in json.dumps(out, ensure_ascii=False) and "сводка" not in json.dumps(out, ensure_ascii=False)
+
+    # refresh-токен отозван: понятная ошибка с подсказкой, файл не портим
+    f.write_text(json.dumps({"access_token": "dead", "refresh_token": "revoked", "expires_at": 1}))
+    with pytest.raises(PlaudAuthError, match="plaud login"):
+        make_api(transport=t).list_recordings(0, 10)
+    assert json.loads(f.read_text())["refresh_token"] == "revoked"
+    f.unlink()
+    with pytest.raises(PlaudAuthError, match="нет файла токенов"):
+        make_api(transport=t).me()
 
 
 # ---------------- iCal ----------------

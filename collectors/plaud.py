@@ -10,20 +10,25 @@
 пересекающееся с записью (±15 минут), даёт calendar_event_id и контекст.
 Не нашлось встречи: контекст personal и meta.personal = true.
 
-API: неофициальный веб-API Plaud (как в github.com/arbuzmell/plaud-api).
-Все пути и ключи JSON собраны в классе PlaudAPI: если Plaud что-то
-поменяет, править только его.
+API: официальный API Plaud для своих данных (platform.plaud.ai/developer/api),
+тот же, что у Plaud CLI (@plaud-ai/cli 0.3.x). Вход один раз на Маке
+(`plaud login`), файл ~/.plaud/tokens.json переносится на дроплет, дальше
+коллектор сам обновляет токен и перезаписывает файл. Все пути и ключи JSON
+собраны в классе PlaudAPI: если Plaud что-то поменяет, править только его.
 
-Секреты: PLAUD_TOKEN (значение заголовка Authorization из web.plaud.ai без
-слова bearer), PLAUD_API_BASE (по умолчанию https://api.plaud.ai; для
-европейского аккаунта может понадобиться региональный хост).
-Настройки источника: {"token_env": "PLAUD_TOKEN", "base_env": "PLAUD_API_BASE",
+Секреты: файл токенов PLAUD_TOKENS_FILE (по умолчанию
+/var/lib/workos-reader/.plaud/tokens.json, 600, владелец workos-reader).
+Необязательно: PLAUD_PLATFORM_BASE (по умолчанию https://platform.plaud.ai/developer/api).
+Настройки источника: {"tokens_env": "PLAUD_TOKENS_FILE", "base_env": "PLAUD_PLATFORM_BASE",
 "match_minutes": 15, "page_size": 50, "pending_days": 30}.
+Проверка: python -m collectors.plaud --probe (печатает только структуру, без текстов).
 """
 from __future__ import annotations
 
 import json
-import random
+import os
+import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
@@ -52,49 +57,178 @@ class PlaudError(RuntimeError):
     pass
 
 
-class PlaudAPI:
-    """Все знания о веб-API Plaud в одном месте."""
+class PlaudAuthError(PlaudError):
+    """Plaud отверг вход: нужен новый plaud login на Маке."""
 
-    LIST_PATH = "/file/simple/web"     # GET: список записей, ключ data_file_list
-    DETAIL_PATH = "/file/list"         # POST [ids]: полные записи с trans_result и ai_content
 
-    def __init__(self, token: str, base: str = "https://api.plaud.ai",
-                 transport: httpx.BaseTransport | None = None):
-        token = token.strip()
-        if token.lower().startswith("bearer "):
-            token = token[7:].strip()
-        self.http = httpx.Client(base_url=base.rstrip("/"), timeout=60, transport=transport, headers={
-            "Authorization": f"bearer {token}",
-            "Accept": "*/*",
-            "Content-Type": "application/json",
-            "Origin": "https://web.plaud.ai",
-            "Referer": "https://web.plaud.ai/",
-            "app-platform": "web",
-            "edit-from": "web",
-        })
+DEFAULT_BASE = "https://platform.plaud.ai/developer/api"
+DEFAULT_TOKENS = "/var/lib/workos-reader/.plaud/tokens.json"
+RELOGIN = ("Plaud: вход истёк или отозван. На Маке: plaud login, потом перенеси ~/.plaud/tokens.json "
+           "на дроплет (SETUP, фаза 2, шаг Plaud)")
 
-    def _check(self, r: httpx.Response) -> dict:
-        if r.status_code == 401:
-            raise PlaudError("Plaud 401: токен истёк, возьми новый в web.plaud.ai (DevTools, Authorization)")
-        if r.status_code >= 400:
-            raise PlaudError(f"Plaud {r.request.url.path}: {r.status_code} {r.text[:200]}")
-        data = r.json()
-        if isinstance(data, dict) and (data.get("status") == -302 or data.get("msg") == "user region mismatch"):
-            raise PlaudError("Plaud: аккаунт в другом регионе, задай PLAUD_API_BASE (например https://api-euc1.plaud.ai)")
+
+class TokenStore:
+    """Файл токенов в формате Plaud CLI: access_token, refresh_token, token_type, expires_at (мс)."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def load(self) -> dict:
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            raise PlaudAuthError(f"Plaud: нет файла токенов {self.path}. " + RELOGIN) from None
+        except (OSError, json.JSONDecodeError) as e:
+            raise PlaudError(f"Plaud: не читается файл токенов {self.path}: {type(e).__name__}") from None
+        if not isinstance(data, dict) or not data.get("access_token"):
+            raise PlaudAuthError("Plaud: в файле токенов нет access_token. " + RELOGIN)
         return data
 
+    def save(self, data: dict) -> None:
+        d = os.path.dirname(self.path) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".tokens.", dir=d)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+class PlaudAPI:
+    """Все знания об API Plaud в одном месте."""
+
+    LIST_PATH = "/open/third-party/files/"          # GET ?page&page_size: {data: [...], page}
+    FILE_PATH = "/open/third-party/files/{id}"      # GET: запись с source_list и note_list
+    ME_PATH = "/open/third-party/users/current"
+    REFRESH_PATH = "/oauth/third-party/access-token/refresh"   # POST form refresh_token
+    TRANSCRIPT_BLOCK = "transaction"
+    SUMMARY_NOTE = "auto_sum_note"
+    SKEW_MS = 60_000
+
+    def __init__(self, tokens_file: str, base: str = DEFAULT_BASE,
+                 transport: httpx.BaseTransport | None = None):
+        self.store = TokenStore(tokens_file)
+        self.base = base.rstrip("/")
+        self.http = httpx.Client(base_url=self.base, timeout=60, transport=transport,
+                                 headers={"Accept": "application/json"})
+        # содержимое блоков по data_link: подписанная ссылка на хранилище, без нашего токена
+        self.blobs = httpx.Client(timeout=60, transport=transport, follow_redirects=True)
+        self._tokens: dict | None = None
+
+    # ---- вход ----
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
+
+    def tokens(self) -> dict:
+        if self._tokens is None:
+            self._tokens = self.store.load()
+        return self._tokens
+
+    def refresh(self) -> dict:
+        cur = self.tokens()
+        rt = cur.get("refresh_token")
+        if not rt:
+            raise PlaudAuthError("Plaud: в файле токенов нет refresh_token. " + RELOGIN)
+        r = self.http.post(self.REFRESH_PATH, data={"refresh_token": rt})
+        if r.status_code in (400, 401, 403):
+            raise PlaudAuthError(f"Plaud отклонил обновление токена ({r.status_code}). " + RELOGIN)
+        if r.status_code >= 400:
+            raise PlaudError(f"Plaud: обновление токена не удалось: {r.status_code}")
+        data = r.json()
+        if not isinstance(data, dict) or not data.get("access_token"):
+            raise PlaudError("Plaud: в ответе обновления нет access_token")
+        new = {"access_token": data["access_token"],
+               "refresh_token": data.get("refresh_token") or rt,
+               "token_type": data.get("token_type") or "Bearer"}
+        if data.get("expires_in"):
+            new["expires_at"] = self._now_ms() + int(data["expires_in"]) * 1000
+        self.store.save(new)
+        self._tokens = new
+        return new
+
+    def access_token(self) -> str:
+        t = self.tokens()
+        exp = t.get("expires_at")
+        if isinstance(exp, (int, float)) and self._now_ms() > exp - self.SKEW_MS:
+            t = self.refresh()
+        return t["access_token"]
+
+    def _get(self, path: str, params: dict | None = None) -> httpx.Response:
+        for attempt in (0, 1):
+            r = self.http.get(path, params=params,
+                              headers={"Authorization": f"Bearer {self.access_token()}"})
+            if r.status_code == 401 and attempt == 0:
+                self.refresh()                       # токен отозвали раньше срока: одна попытка
+                continue
+            return r
+        return r
+
+    def _check(self, r: httpx.Response):
+        if r.status_code == 401:
+            raise PlaudAuthError("Plaud 401. " + RELOGIN)
+        if r.status_code >= 400:
+            raise PlaudError(f"Plaud {r.request.url.path}: {r.status_code} {r.text[:200]}")
+        return r.json()
+
+    # ---- данные ----
+    def me(self) -> dict:
+        return self._check(self._get(self.ME_PATH)) or {}
+
     def list_recordings(self, skip: int = 0, limit: int = 50) -> list[dict]:
-        """Записи от новых к старым по времени начала."""
-        r = self.http.get(self.LIST_PATH, params={"skip": skip, "limit": limit, "is_trash": 0,
-                                                   "sort_by": "start_time", "is_desc": "true",
-                                                   "r": random.random()})
-        return self._check(r).get("data_file_list") or []
+        """Записи от новых к старым (как их отдаёт Plaud и как читает CLI)."""
+        limit = max(1, min(100, int(limit)))
+        page = skip // limit + 1
+        data = self._check(self._get(self.LIST_PATH, {"page": page, "page_size": limit}))
+        items = data.get("data") if isinstance(data, dict) else data
+        return items if isinstance(items, list) else []
+
+    def get_file(self, file_id: str) -> dict | None:
+        r = self._get(self.FILE_PATH.format(id=file_id))
+        if r.status_code == 404:
+            return None
+        data = self._check(r)
+        if isinstance(data, dict) and isinstance(data.get("data"), dict) and "id" not in data:
+            data = data["data"]
+        return data if isinstance(data, dict) else None
+
+    def block_text(self, block: dict | None) -> str:
+        if not isinstance(block, dict):
+            return ""
+        inline = block.get("data_content")
+        if isinstance(inline, str) and inline:
+            return inline
+        link = block.get("data_link")
+        if isinstance(link, str) and link.startswith("https://"):
+            r = self.blobs.get(link)
+            if r.status_code >= 400:
+                raise PlaudError(f"Plaud: содержимое блока не скачалось: {r.status_code}")
+            return r.text
+        return ""
 
     def get_details(self, file_ids: list[str]) -> list[dict]:
-        if not file_ids:
-            return []
-        r = self.http.post(self.DETAIL_PATH, json=file_ids)
-        return self._check(r).get("data_file_list") or []
+        """Полные записи; транскрипт и сводка разложены в trans_result и ai_content."""
+        out = []
+        for fid in file_ids:
+            f = self.get_file(fid)
+            if not f:
+                continue
+            src = next((b for b in f.get("source_list") or []
+                        if isinstance(b, dict) and b.get("data_type") == self.TRANSCRIPT_BLOCK), None)
+            note = next((n for n in f.get("note_list") or []
+                         if isinstance(n, dict) and n.get("data_type") == self.SUMMARY_NOTE), None)
+            f["trans_result"] = self.block_text(src) if src else []
+            summary = self.block_text(note) if note else ""
+            if summary:
+                f["ai_content"] = summary
+            out.append(f)
+        return out
 
     # ---- разбор полей записи ----
     @staticmethod
@@ -103,10 +237,11 @@ class PlaudAPI:
 
     @staticmethod
     def started_at(rec: dict) -> datetime | None:
-        ts = rec.get("start_time")
-        if isinstance(ts, (int, float)) and ts > 0:
-            return datetime.fromtimestamp(ts / 1000, UTC)
-        for key in ("created_at", "start_time"):
+        for key in ("start_at", "start_time"):
+            ts = rec.get(key)
+            if isinstance(ts, (int, float)) and ts > 0:
+                return datetime.fromtimestamp(ts / 1000 if ts > 10**11 else ts, UTC)
+        for key in ("start_at", "created_at", "start_time"):
             v = rec.get(key)
             if isinstance(v, str):
                 try:
@@ -210,9 +345,7 @@ class PlaudCollector(Collector):
         self.transport = transport
 
     def api(self) -> PlaudAPI:
-        token = config.env(self.cfg.get("token_env") or "PLAUD_TOKEN", required=True)
-        base = config.env(self.cfg.get("base_env") or "PLAUD_API_BASE", "https://api.plaud.ai")
-        return PlaudAPI(token, base, transport=self.transport)
+        return make_api(self.cfg, self.transport)
 
     def _known(self, conn, ids: list[str]) -> set[str]:
         if not ids:
@@ -328,9 +461,59 @@ class PlaudCollector(Collector):
         if meta.get("summary") is None:
             meta.pop("summary", None)
         return Event(external_id=api.file_id(rec), kind="meeting", occurred_at=start,
-                     title=rec.get("filename") or (cal["title"] if cal else None),
+                     title=rec.get("name") or rec.get("filename") or (cal["title"] if cal else None),
                      body=format_transcript(segs), meta=meta, context_id=ctx,
                      thread_key=f"plaud:{api.file_id(rec)}")
+
+
+def make_api(cfg: dict | None = None, transport: httpx.BaseTransport | None = None) -> PlaudAPI:
+    cfg = cfg or {}
+    tokens = config.env(cfg.get("tokens_env") or "PLAUD_TOKENS_FILE", DEFAULT_TOKENS)
+    base = config.env(cfg.get("base_env") or "PLAUD_PLATFORM_BASE", DEFAULT_BASE)
+    return PlaudAPI(tokens, base, transport=transport)
+
+
+def _jwt_exp(tok) -> str:
+    try:
+        import base64
+        part = str(tok).split(".")[1]
+        payload = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        return datetime.fromtimestamp(payload["exp"], UTC).isoformat()
+    except Exception:
+        return "неизвестно"
+
+
+def _shape(v):
+    if isinstance(v, dict):
+        return {k: _shape(x) if isinstance(x, (dict, list)) else type(x).__name__ for k, x in v.items()}
+    if isinstance(v, list):
+        return [_shape(v[0])] if v and isinstance(v[0], (dict, list)) else f"list[{len(v)}]"
+    return type(v).__name__
+
+
+def probe(transport: httpx.BaseTransport | None = None) -> dict:
+    """Проверка входа и формы ответов. Тексты, имена и токены не печатает."""
+    api = make_api(transport=transport)
+    t = api.tokens()
+    out = {"access_exp": _jwt_exp(t.get("access_token")), "refresh_exp": _jwt_exp(t.get("refresh_token"))}
+    me = api.me()
+    out["me_keys"] = sorted(me.keys()) if isinstance(me, dict) else type(me).__name__
+    items = api.list_recordings(0, 10)
+    out["list_count"] = len(items)
+    if items:
+        first = items[0]
+        out["list_item"] = _shape(first)
+        out["first_started_at"] = str(api.started_at(first))
+        f = api.get_file(api.file_id(first)) or {}
+        out["file_keys"] = sorted(f.keys())
+        out["source_types"] = [b.get("data_type") for b in f.get("source_list") or [] if isinstance(b, dict)]
+        out["note_types"] = [n.get("data_type") for n in f.get("note_list") or [] if isinstance(n, dict)]
+        d = api.get_details([api.file_id(first)])
+        segs = api.segments(d[0]) if d else []
+        out["segments"] = len(segs)
+        out["summary_chars"] = len(api.summary(d[0]) or "") if d else 0
+    out["tokens_after"] = {"access_exp": _jwt_exp(api.tokens().get("access_token"))}
+    return out
 
 
 def run(date: str | None = None, dry_run: bool = False, **kw) -> dict:
@@ -338,4 +521,8 @@ def run(date: str | None = None, dry_run: bool = False, **kw) -> dict:
 
 
 if __name__ == "__main__":
-    print(run())
+    import sys
+    if "--probe" in sys.argv:
+        print(json.dumps(probe(), ensure_ascii=False, indent=2))
+    else:
+        print(run())

@@ -142,8 +142,16 @@ done
 4. **Trello (чтение).** Ключ на trello.com/power-ups/admin, токен:
    `https://trello.com/1/authorize?expiration=never&scope=read&response_type=token&key=<KEY>`.
    Проверка: `sudo -u workos-reader WORKOS_ROLE=reader .venv/bin/python -m collectors.trello whoami`.
-5. **Plaud.** web.plaud.ai → DevTools → Network → любой запрос к api.plaud.ai → заголовок Authorization
-   → `PLAUD_TOKEN`. API неофициальный, токен иногда придётся обновлять.
+5. **Plaud** (официальный вход, токен обновляется сам).
+   - На Маке: `npm install -g @plaud-ai/cli && plaud login && plaud recent` (нужен Node 20+). `plaud recent`
+     должен показать записи.
+   - Перенести `~/.plaud/tokens.json` на дроплет в `/var/lib/workos-reader/.plaud/tokens.json`
+     (каталог создаёт `install.sh`), владелец `workos-reader`, права 600. Файл не показывать и не коммитить.
+   - На Маке после переноса **не** запускать `plaud logout`: он отзывает вход, и дроплет его потеряет.
+     Сам CLI на Маке пользоваться можно, но надёжнее держать вход только на дроплете.
+   - Проба (печатает только структуру ответов и сроки токенов, без текстов):
+     `sudo -u workos-reader WORKOS_ROLE=reader .venv/bin/python -m collectors.plaud --probe`.
+   - Если в «Системе» алерт «вход истёк или отозван»: снова `plaud login` на Маке и перенос файла.
 6. **Slack.** api.slack.com/apps → Create App в воркспейсе Инфатики → User Token Scopes:
    `channels:history`, `groups:history`, `search:read`, `users:read` → Install → `xoxp-...` в `SLACK_TOKEN`.
 7. **Альфа (EAS, 2.4).**

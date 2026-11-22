@@ -16,8 +16,8 @@ WORKOS_SELF_NAMES=Георгий,Жора,Гоша,George
 # --- фаза 2 ---
 TRELLO_KEY=
 TRELLO_TOKEN=
-PLAUD_TOKEN=
-# PLAUD_API_BASE=https://api.plaud.ai
+# Plaud: файл токенов от `plaud login` с Мака (официальный CLI), коллектор сам его обновляет
+# PLAUD_TOKENS_FILE=/var/lib/workos-reader/.plaud/tokens.json
 ICAL_PERSONAL_URL=
 ICAL_INFATICA_URL=
 SLACK_TOKEN=
