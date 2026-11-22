@@ -69,9 +69,9 @@ def build_mime(p: dict) -> bytes:
 
 
 def manual_accounts() -> set[str]:
-    """Ящики без API черновиков (Альфа: Exchange по ActiveSync). Для них черновик
+    """Ящики без API черновиков (Альфа: Exchange по ActiveSync или через айфон). Для них черновик
     приходит текстом в «Решения», отправляет George сам из своего клиента."""
-    return {x.strip() for x in (config.env("MANUAL_DRAFT_ACCOUNTS", "alfa,eas:alfa") or "").split(",") if x.strip()}
+    return {x.strip() for x in (config.env("MANUAL_DRAFT_ACCOUNTS", "alfa,eas:alfa,ios:alfa") or "").split(",") if x.strip()}
 
 
 def execute(action: dict, notify) -> dict:

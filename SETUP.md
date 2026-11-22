@@ -154,25 +154,27 @@ done
    - Если в «Системе» алерт «вход истёк или отозван»: снова `plaud login` на Маке и перенос файла.
 6. **Slack.** api.slack.com/apps → Create App в воркспейсе Инфатики → User Token Scopes:
    `channels:history`, `groups:history`, `search:read`, `users:read` → Install → `xoxp-...` в `SLACK_TOKEN`.
-7. **Альфа (EAS, 2.4).**
-   - DeviceId: `python3 -c "import secrets; print('WorkOS' + secrets.token_hex(8).upper())"` → `ALFA_EAS_DEVICE_ID`.
-   - Сертификат: на Маке «Связка ключей» → Система/Системные корневые → «Russian Trusted Root CA»
-     (и «Russian Trusted Sub CA», если есть) → Экспорт в .pem, склеить в
-     `/opt/workos/certs/russian_trusted_root_ca.pem`. Проверку TLS не отключать.
-   - Письмо в ИТ **до** первого подключения (см. ниже). Пока ИТ не одобрило устройство, источник
-     `eas:alfa` не включай: `phase.sh 2` включает и юнит `workos-eas`, но при выключенном источнике он
-     выходит с кодом 3 и systemd его не перезапускает. Включаешь источник (шаг 8) только после ответа ИТ,
-     потом `systemctl restart workos-eas`.
-   - Проба и первый прогон:
-     ```bash
-     sudo -u workos-reader WORKOS_ROLE=reader .venv/bin/python -m collectors.eas --probe
-     sudo -u workos-reader WORKOS_ROLE=reader .venv/bin/python -m collectors.eas --once
-     ```
+7. **Альфа через айфон** (вместо EAS: новое устройство в Exchange не добавляется).
+   Айфон по расписанию (7, 11, 15, 19) шлёт встречи календаря Альфы и письма ящика Alfabank
+   на приёмник дроплета по Tailscale. Разбор: `collectors/ios.py`, источник `ios:alfa`.
+   - На айфоне Tailscale тем же аккаунтом, что и дроплет. Tailnet-адрес дроплета: `tailscale ip -4`.
+   - В `.env.reader`: `INGEST_TOKEN` (`openssl rand -hex 32`) и `INGEST_BIND=<tailnet-ip>:8788`.
+   - `systemctl enable --now workos-ingest`, проверка с айфона или Мака в tailnet:
+     `curl http://<tailnet-ip>:8788/health` → `{"ok": true}`.
+   - `UPDATE work.sources SET enabled = true WHERE id = 'ios:alfa';`
+   - Команда «WorkOS Alfa» в «Командах»: Find Calendar Events (календарь Альфы, Start Date в ближайшие
+     60 дней) и Find Message (Date Received за 13 часов), письма только с Account = Alfabank; даты в ISO 8601;
+     POST JSON `{"now", "calendar": [...], "mail": [...]}` на `http://<tailnet-ip>:8788/ingest/ios:alfa`
+     с заголовком `Authorization: Bearer <INGEST_TOKEN>`. Формат полей в `collectors/ios.py`.
+   - Автоматизации Time of Day в 7:00, 11:00, 15:00, 19:00 и App «Mail, Calendar is Closed», все «Run Immediately».
+     Повторная отправка безопасна: записи с тем же id обновляются, а не дублируются.
+   - EAS (`collectors/eas.py`, источник `eas:alfa`) остаётся в коде выключенным; `workos-eas` при
+     выключенном источнике выходит с кодом 3 и не перезапускается.
 8. **Включить источники:**
    ```sql
    UPDATE work.sources SET enabled = true, config = '{"board_id":"6a197760b7795b2a91550ec0"}' WHERE id = 'trello:george';
    UPDATE work.sources SET enabled = true WHERE id IN ('plaud','ical:personal','ical:infatica');
-   UPDATE work.sources SET enabled = true WHERE id = 'eas:alfa';      -- только после одобрения ИТ
+   UPDATE work.sources SET enabled = true WHERE id = 'ios:alfa';      -- Альфа через айфон, шаг 7
    UPDATE work.sources SET enabled = true, config = '{"channels":["C..."],"user_id":"U..."}' WHERE id = 'slack:infatica';
    ```
    (под админом: `set -a; . .env.admin; set +a; psql`). Потом `bash deploy/phase.sh 2`.

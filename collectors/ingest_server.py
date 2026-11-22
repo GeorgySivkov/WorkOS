@@ -9,9 +9,11 @@ workos_reader). Слушает INGEST_BIND (по умолчанию 127.0.0.1:87
     {"events": [{"external_id", "kind", "occurred_at" (ISO), "title", "body",
                  "actor_raw", "thread_key", "meta"}], "watermark": "..."}
 
-Принимается только для включённых источников вида 'achat'. Запись
+Принимается только для включённых источников вида 'achat' и 'ios'.
+Источник 'ios' (Альфа через «Команды» айфона) шлёт свой формат, его разбирает
+collectors/ios.py: {"now", "calendar": [...], "mail": [...]}. Запись
 идемпотентна (collectors.base.upsert_events), last_ok_at и watermark
-обновляются. Тело запроса не больше 2 МБ. kind всегда 'message' (другое: 400),
+обновляются. Тело запроса не больше 10 МБ. kind всегда 'message' (другое: 400),
 в meta только известные ключи А-Чата со строками и числами (META_KEYS), остальное: 400,
 чтобы снаружи нельзя было подложить служебные метки (plan_paste, domain, action_id и т.п.).
 
@@ -31,10 +33,10 @@ from collectors.base import Event, upsert_events
 from core import config, db
 
 UTC = timezone.utc
-MAX_BODY = 2 * 1024 * 1024
+MAX_BODY = 10 * 1024 * 1024
 MAX_EVENTS = 5000
 PATH_RX = re.compile(r"^/ingest/([A-Za-z0-9:_\-.]{1,100})/?$")
-ALLOWED_KINDS = {"achat"}
+ALLOWED_KINDS = {"achat", "ios"}
 EVENT_KIND = "message"
 # что шлёт mac/achat_collector.py: чат, автор, режим чтения и идентификаторы приложения
 META_KEYS = {"chat", "author", "mode", "chat_id", "author_id", "message_id", "app", "bundle_id"}
@@ -100,18 +102,8 @@ def parse_event(raw: dict) -> Event:
 
 def ingest(source_id: str, payload: dict) -> tuple[int, dict]:
     """Записать пачку событий. Возвращает (HTTP-код, ответ)."""
-    if not isinstance(payload, dict) or not isinstance(payload.get("events", []), list):
-        return 400, {"error": "ожидается {\"events\": [...]}"}
-    raw_events = payload.get("events") or []
-    if len(raw_events) > MAX_EVENTS:
-        return 413, {"error": f"не больше {MAX_EVENTS} событий за раз"}
-    try:
-        events = [parse_event(e) for e in raw_events]
-    except BadRequest as e:
-        return 400, {"error": str(e)}
-    wm = payload.get("watermark")
-    if wm is not None and not isinstance(wm, (str, int, float)):
-        return 400, {"error": "watermark должна быть строкой"}
+    if not isinstance(payload, dict):
+        return 400, {"error": "ожидается объект JSON"}
     with db.connect() as conn, conn.transaction():
         src = conn.execute("SELECT * FROM work.sources WHERE id = %s FOR UPDATE", (source_id,)).fetchone()
         if not src:
@@ -120,11 +112,39 @@ def ingest(source_id: str, payload: dict) -> tuple[int, dict]:
             return 403, {"error": "этот источник не принимает события снаружи"}
         if not src["enabled"]:
             return 403, {"error": "источник выключен"}
+        if src["kind"] == "ios":
+            return _ingest_ios(conn, src, payload)
+        if not isinstance(payload.get("events", []), list):
+            return 400, {"error": "ожидается {\"events\": [...]}"}
+        raw_events = payload.get("events") or []
+        if len(raw_events) > MAX_EVENTS:
+            return 413, {"error": f"не больше {MAX_EVENTS} событий за раз"}
+        try:
+            events = [parse_event(e) for e in raw_events]
+        except BadRequest as e:
+            return 400, {"error": str(e)}
+        wm = payload.get("watermark")
+        if wm is not None and not isinstance(wm, (str, int, float)):
+            return 400, {"error": "watermark должна быть строкой"}
         ins, upd, seen = upsert_events(conn, src, events)
         conn.execute("UPDATE work.sources SET watermark = COALESCE(%s, watermark), last_ok_at = now(), "
                      "last_error = NULL WHERE id = %s",
                      (str(wm)[:500] if wm is not None else None, source_id))
     return 200, {"inserted": ins, "updated": upd, "seen": len(seen)}
+
+
+def _ingest_ios(conn, src: dict, payload: dict) -> tuple[int, dict]:
+    from collectors import ios
+    try:
+        cal, mail, window = ios.parse(payload, src.get("config") or {})
+    except ios.BadPayload as e:
+        return 400, {"error": str(e)}
+    ins, upd, seen = upsert_events(conn, src, [*cal, *mail])
+    cancelled = ios.cancel_missing(conn, src["id"], window, [e.external_id for e in cal]) if window else 0
+    conn.execute("UPDATE work.sources SET watermark = %s, last_ok_at = now(), last_error = NULL WHERE id = %s",
+                 (str(payload.get("now"))[:64], src["id"]))
+    return 200, {"inserted": ins, "updated": upd, "calendar": len(cal), "mail": len(mail),
+                 "cancelled": cancelled}
 
 
 def make_handler(token: str):
@@ -165,7 +185,7 @@ def make_handler(token: str):
                 return self._send(400, {"error": "пустое тело"})
             if length > MAX_BODY:
                 self.close_connection = True
-                return self._send(413, {"error": "тело больше 2 МБ"})
+                return self._send(413, {"error": "тело больше 10 МБ"})
             try:
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
@@ -175,7 +195,7 @@ def make_handler(token: str):
             except Exception as e:  # noqa: BLE001: ответить Маку и записать ошибку источнику
                 try:
                     with db.connect(autocommit=True) as conn:
-                        conn.execute("UPDATE work.sources SET last_error = %s WHERE id = %s AND kind = 'achat'",
+                        conn.execute("UPDATE work.sources SET last_error = %s WHERE id = %s AND kind IN ('achat', 'ios')",
                                      (f"ingest: {type(e).__name__}: {e}"[:1500], m.group(1)))
                 except Exception:  # noqa: BLE001
                     pass

@@ -738,15 +738,82 @@ def test_ingest_server_auth_kind_and_idempotency(admin, mk_source, ingest_server
     assert s["last_ok_at"] is not None and s["watermark"] == "2026-10-29T09:01:00+00:00"
     assert events(admin, "trello:ingest") == []
 
-    # больше 2 МБ: отказ до чтения тела
+    # больше 10 МБ: отказ до чтения тела
     host, port = url.removeprefix("http://").split(":")
     conn = http.client.HTTPConnection(host, int(port), timeout=10)
     conn.putrequest("POST", "/ingest/achat:test")
     conn.putheader("Authorization", f"Bearer {TOKEN}")
-    conn.putheader("Content-Length", str(3 * 1024 * 1024))
+    conn.putheader("Content-Length", str(11 * 1024 * 1024))
     conn.endheaders()
     assert conn.getresponse().status == 413
     conn.close()
+
+
+def _ios_payload(now: datetime, cal: list[dict], mail: list[dict]) -> dict:
+    return {"now": now.astimezone(timezone(timedelta(hours=1))).isoformat(timespec="seconds"),
+            "calendar": cal, "mail": mail}
+
+
+def test_ios_alfa_calendar_and_mail(admin, mk_source, ingest_server):
+    """Айфон шлёт встречи и письма: пишем только ящик Alfabank, пропавшие встречи отменяем."""
+    mk_source("ios:test", "ios", "alfa", {"account": "Alfabank"})
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+    now = tu.now().replace(microsecond=0)
+    madrid = timezone(timedelta(hours=1))
+
+    def at(h: float) -> str:
+        return (now + timedelta(hours=h)).astimezone(madrid).isoformat(timespec="seconds")
+
+    cal = [{"title": "Ретро поддержки", "start": at(2), "end": at(3), "all_day": "No", "location": "Teams"},
+           {"title": "Синк SFA", "start": at(26), "end": at(27), "all_day": False},
+           {"title": "Отпуск Яна", "start": at(48), "end": at(72), "all_day": "Yes"}]
+    mail = [{"account": "Alfabank", "mailbox": "Inbox", "subject": "Выгрузка", "sender": "Ян <yan@alfabank.ru>",
+             "to": "George <g@alfabank.ru>", "cc": "", "received": at(-1), "read": "No", "body": "Добрый день."},
+            {"account": "Gmail", "subject": "личное", "sender": "x@gmail.com", "received": at(-1), "body": "не наше"}]
+    with httpx.Client(timeout=10) as c:
+        r = c.post(f"{ingest_server}/ingest/ios:test", json=_ios_payload(now, cal, mail), headers=auth)
+        assert r.status_code == 200, r.text
+        assert r.json()["calendar"] == 3 and r.json()["mail"] == 1 and r.json()["inserted"] == 4
+        # плохая дата: 400, ничего не пишется
+        bad = _ios_payload(now, [{"title": "x", "start": "22 Nov 2026 at 10:00"}], [])
+        assert c.post(f"{ingest_server}/ingest/ios:test", json=bad, headers=auth).status_code == 400
+
+        rows = {e["title"]: e for e in events(admin, "ios:test")}
+        assert set(rows) == {"Ретро поддержки", "Синк SFA", "Отпуск Яна", "Выгрузка"}
+        assert all(e["context_id"] == "alfa" for e in rows.values())
+        m = rows["Выгрузка"]
+        assert m["kind"] == "email" and m["body"] == "Добрый день." and m["meta"]["from_email"] == "yan@alfabank.ru"
+        assert m["meta"]["to_emails"] == ["g@alfabank.ru"] and m["meta"]["read"] is False
+        feed = {f["title"]: f for f in admin.execute(
+            "SELECT * FROM work.calendar_feed WHERE source_id = 'ios:test'").fetchall()}
+        assert feed["Ретро поддержки"]["location"] == "Teams" and feed["Ретро поддержки"]["busy"] is True
+        day = feed["Отпуск Яна"]
+        assert day["all_day"] is True and tu.local(day["starts_at"]).hour == 0 and tu.local(day["ends_at"]).hour == 0
+
+        # следующий запуск: «Синк SFA» перенесли на час, письмо прочитано, календарь пуст не целиком
+        cal2 = [cal[0], {**cal[1], "start": at(27), "end": at(28)}, cal[2]]
+        mail2 = [{**mail[0], "read": "Yes"}]
+        r2 = c.post(f"{ingest_server}/ingest/ios:test", json=_ios_payload(now, cal2, mail2), headers=auth).json()
+        assert r2["inserted"] == 1 and r2["cancelled"] == 1
+        feed = admin.execute("SELECT title, status, starts_at FROM work.calendar_feed WHERE source_id = 'ios:test' "
+                             "AND title = 'Синк SFA' ORDER BY starts_at").fetchall()
+        assert [f["status"] for f in feed] == ["cancelled", "confirmed"]
+        assert len([e for e in events(admin, "ios:test") if e["kind"] == "email"]) == 1
+        assert [e for e in events(admin, "ios:test") if e["kind"] == "email"][0]["meta"]["read"] is True
+
+        # пустой календарь (сбой команды) ничего не отменяет
+        r3 = c.post(f"{ingest_server}/ingest/ios:test", json=_ios_payload(now, [], []), headers=auth).json()
+        assert r3["cancelled"] == 0
+    s = src(admin, "ios:test")
+    assert s["last_ok_at"] is not None and s["last_error"] is None
+
+
+def test_ios_source_seeded_and_health_threshold(admin):
+    from health import threshold
+    s = src(admin, "ios:alfa")
+    assert s["kind"] == "ios" and s["context_id"] == "alfa" and s["enabled"] is False
+    assert s["config"]["account"] == "Alfabank"
+    assert threshold({"kind": "ios", "config": {}}) == 13.0
 
 
 # ---------------- коллектор на Маке ----------------
