@@ -40,6 +40,19 @@ def cells(admin):
     return {r["id"]: r for r in admin.execute("SELECT * FROM rpg.cells")}
 
 
+def test_seed_resets_added_on_only_when_practice_changes(admin, grid_file):
+    from rpg import seed
+    seed.run(grid_file())
+    admin.execute("UPDATE rpg.cells SET added_on = DATE '2026-01-01'")
+    seed.run(grid_file())                                                     # те же названия: дата остаётся
+    assert admin.execute("SELECT added_on FROM rpg.cells WHERE id = 'A1'").fetchone()["added_on"] == date(2026, 1, 1)
+    data = json.loads(json.dumps(GRID))
+    data["dirs"][0]["acts"][0]["t"] = "Другая практика раз в 7 дней"
+    seed.run(grid_file(data))                                                 # на месте A1 новая практика
+    rows = {r["id"]: r["added_on"] for r in admin.execute("SELECT id, added_on FROM rpg.cells WHERE id IN ('A1', 'A2')")}
+    assert rows["A1"] == admin.execute("SELECT current_date AS d").fetchone()["d"] and rows["A2"] == date(2026, 1, 1)
+
+
 def test_seed_idempotent_and_deactivates(admin, grid_file):
     from rpg import seed
     f = grid_file()

@@ -32,6 +32,7 @@ import psycopg
 from agents import scheduler
 from app import initdata
 from core import config, db, ruparse, timeutil as tu
+from rpg import period as habit_period
 
 STATIC = Path(__file__).resolve().parent / "static"
 NAME = "Георгий"
@@ -142,16 +143,6 @@ def task_obj(r, today: date) -> dict:
         "done": done, "overdue": (not done and r["due"] is not None and r["due"] < today),
         "remind_at": iso(r["remind_at"]), "planned_by": r["planned_by"],
     }
-
-
-def streak(days: set[date], today: date) -> int:
-    """Дней подряд с опытом; серия жива, если сегодня ещё не отмечено, но вчера было."""
-    d = today if today in days else today - timedelta(days=1)
-    n = 0
-    while d in days:
-        n += 1
-        d -= timedelta(days=1)
-    return n
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:
@@ -307,7 +298,7 @@ class Api:
     def _habits(self, conn, today: date) -> list[dict]:
         lo, hi = tu.day_bounds(today)
         rows = conn.execute(
-            """SELECT c.id, c.title, c.auto_source, c.xp_base, p.title AS dir,
+            """SELECT c.id, c.title, c.auto_source, c.xp_base, c.added_on, p.title AS dir,
                       EXISTS (SELECT 1 FROM rpg.xp x WHERE x.cell_id = c.id
                               AND x.earned_at >= %s AND x.earned_at < %s) AS done
                FROM rpg.cells c LEFT JOIN rpg.cells p ON p.id = c.parent
@@ -315,9 +306,12 @@ class Api:
         facts = self._xp_days(conn)
         out = []
         for r in rows:
-            n = streak(facts.get(r["id"], {}).get("days", set()), today)
-            src = r["auto_source"]
-            if src:
+            spec = habit_period.parse(r["title"])
+            st = habit_period.status(spec, facts.get(r["id"], {}).get("days", set()), today, r["added_on"])
+            n, src, periodic = st["streak"], r["auto_source"], spec["kind"] != "daily"
+            if periodic:                      # «пора · осталось 2 дн.», «1/3 на неделе», «следующий к 29.11»
+                note = st["note"] + (" · Garmin" if src and src.startswith("garmin") else "")
+            elif src:
                 note = ("из Garmin" if src.startswith("garmin")
                         else "оценкой дня" if src.startswith("rating") else "сама")
             elif n:
@@ -327,6 +321,7 @@ class Api:
             via = None if not src else "garmin" if src.startswith("garmin") \
                 else "rating" if src.startswith("rating") else "auto"
             out.append({"cell_id": r["id"], "title": r["title"], "dir": r["dir"], "note": note, "done": bool(r["done"]),
+                        "due": bool(st["due"]) and not r["done"], "periodic": periodic,
                         "auto": src is not None, "via": via, "streak": n})
         return out
 
@@ -647,8 +642,10 @@ class Api:
                            "ORDER BY earned_at DESC, code").fetchall()
         habits = conn.execute("SELECT id, title FROM rpg.cells WHERE kind = 'habit' AND active ORDER BY id").fetchall()
         facts = self._xp_days(conn)
-        streaks = [{"cell_id": h["id"], "title": h["title"],
-                    "days": streak(facts.get(h["id"], {}).get("days", set()), today)} for h in habits]
+        streaks = []
+        for h in habits:
+            n, forms = habit_period.streak_of(h["title"], facts.get(h["id"], {}).get("days", set()), today)
+            streaks.append({"cell_id": h["id"], "title": h["title"], "days": n, "forms": list(forms)})
         streaks.sort(key=lambda s: (-s["days"], s["cell_id"]))
         return {**ch, "season": f"Сезон {season}", "main_quest": mq["title"] if mq else None,
                 "attributes": attrs,
@@ -675,7 +672,7 @@ class Api:
             for c in kids:
                 f = facts.get(c["id"], {"n": 0, "days": set()})
                 if c["kind"] == "habit":
-                    stat = f"серия {streak(f['days'], today)}"
+                    stat = f"серия {habit_period.streak_of(c['title'], f['days'], today)[0]}"
                 elif c["kind"] == "milestone":
                     stat = "сделано" if f["n"] else ("босс" if c["xp_base"] >= 200 else "впереди")
                 else:

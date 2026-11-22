@@ -86,6 +86,8 @@
     return many;
   }
   const days = (n) => n + ' ' + plural(n, 'день', 'дня', 'дней');
+  // серия в своих единицах: дни у ежедневной, недели у «3 раза в 7 дней», «раз подряд» у «раз в 14 дней»
+  const streakText = (s) => { const f = s.forms || ['день', 'дня', 'дней']; return s.days + ' ' + plural(s.days, f[0], f[1], f[2]); };
   const WD = ['пн', 'вт', 'ср', 'чт', 'пт', 'сб', 'вс'];
   const WD_FULL = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье'];
   const MON = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
@@ -556,7 +558,9 @@
   function paintHabits() {
     const all = S.today.habits;
     const open = !!S.habitsOpen;
-    const kids = [secTitle('Ритуалы дня', 'h-title', all.filter((x) => x.done).length + '/' + all.length)];
+    // счётчик: сделано сегодня из того, что на сегодня нужно (ежедневные и периодические в окне «пора»)
+    const doneN = all.filter((x) => x.done).length;
+    const kids = [secTitle('Ритуалы дня', 'h-title', doneN + '/' + (doneN + all.filter((x) => x.due).length))];
     let shown = 0;
     if (open) {
       let dir = null;
@@ -566,10 +570,11 @@
       }
       shown = all.length;
     } else {
-      const undone = all.filter((x) => !x.done);
-      const pick = undone.filter((x) => !x.auto).concat(undone.filter((x) => x.auto)).slice(0, HABITS_SHOWN);
+      // периодические видны, только когда подошёл срок (due); остальные ждут в «Все ритуалы»
+      const due = all.filter((x) => x.due);
+      const pick = due.filter((x) => !x.auto).concat(due.filter((x) => x.auto)).slice(0, HABITS_SHOWN);
       for (const hb of pick) kids.push(habitRow(hb));
-      if (!pick.length) kids.push(h('p', { class: 'empty' }, 'Все ритуалы на сегодня отмечены'));
+      if (!pick.length) kids.push(h('p', { class: 'empty' }, 'На сегодня ритуалы отмечены'));
       shown = pick.length;
     }
     if (open || shown < all.length) {
@@ -582,7 +587,7 @@
     T.habits.replaceChildren.apply(T.habits, kids);
   }
   function habitRow(hb) {
-    const b = h('button', { type: 'button', class: 'habit' + (hb.done ? ' on' : '') + (hb.auto ? ' auto' : ''),
+    const b = h('button', { type: 'button', class: 'habit' + (hb.done ? ' on' : '') + (hb.auto ? ' auto' : '') + (hb.periodic && hb.due ? ' soon' : ''),
       'aria-pressed': String(!!hb.done), 'aria-disabled': hb.auto && hb.via !== 'rating' ? 'true' : null },
     h('span', { class: 'gem', 'aria-hidden': 'true' }), h('span', { class: 'hn' }, hb.title), h('span', { class: 'hs' }, hb.note || ''));
     const label = () => b.setAttribute('aria-label', (hb.via === 'rating' ? 'Ритуал отмечается оценкой дня, перейти к ползунку' + (hb.done ? ', выполнен: ' : ': ')
@@ -916,7 +921,7 @@
     const rusty = (c.attributes || []).filter((a) => a.rusty).sort((a, b) => (b.idle_days == null ? 1e9 : b.idle_days) - (a.idle_days == null ? 1e9 : a.idle_days))[0];
     if (rusty) out.push(rusty.idle_days != null ? '«' + rusty.title + '» без опыта ' + days(rusty.idle_days) + '. Займёмся?' : '«' + rusty.title + '» ещё ждёт первого опыта. Начнём?');
     const st = (c.streaks || [])[0];
-    if (st && st.days > 1) out.push(st.title + ': ' + days(st.days) + ' подряд. Держим строй!');
+    if (st && st.days > 1) out.push(st.title + ': ' + streakText(st) + ' подряд. Держим строй!');
     const strong = (c.attributes || []).slice().sort((a, b) => b.xp - a.xp)[0];
     if (strong && strong.xp > 0) out.push('Сильнее всего у нас «' + strong.title + '», уровень ' + strong.level + '.');
     if (c.main_quest) out.push('Помню главный квест: ' + c.main_quest);
@@ -986,7 +991,7 @@
     const streaks = (c.streaks || []).filter((s) => s.days > 0).slice(0, 4);
     if (streaks.length) {
       body.append(h('div', { class: 'group' }, secTitle('Серии'),
-        h('div', { class: 'chips' }, streaks.map((s) => h('span', { class: 'chip' }, s.title + ' · ', h('b', null, s.days), ' ' + plural(s.days, 'день', 'дня', 'дней'))))));
+        h('div', { class: 'chips' }, streaks.map((s) => h('span', { class: 'chip' }, s.title + ' · ', h('b', null, s.days), ' ' + streakText(s).replace(/^\d+ /, ''))))));
     }
 
     const ach = c.achievements || [];
@@ -1104,11 +1109,12 @@
       { cell_id: 'A2', dir: 'Здоровье', title: 'Растяжка 10 минут после работы', note: 'серия 4', done: false, auto: false, via: null },
       { cell_id: 'A3', dir: 'Здоровье', title: '10 000 шагов в день', note: 'из Garmin', done: false, auto: true, via: 'garmin' },
       { cell_id: 'B3', dir: 'Карьера', title: 'Оценка дня от -10 до +10', note: 'оценкой дня', done: false, auto: true, via: 'rating' },
-      { cell_id: 'B4', dir: 'Карьера', title: 'Разговор с наставником раз в 14 дней', note: '+10 опыта', done: false, auto: false, via: null },
+      { cell_id: 'B4', dir: 'Карьера', title: 'Разговор с наставником раз в 14 дней', note: 'пора · осталось 2 дн.', done: false, auto: false, via: null, periodic: true },
+      { cell_id: 'B5', dir: 'Карьера', title: 'Пост в LinkedIn раз в 7 дней', note: 'следующий к 27.11', done: false, auto: false, via: null, periodic: true },
       { cell_id: 'E1', dir: 'Знания', title: 'Английский 20 минут', note: '+10 опыта', done: false, auto: false, via: null },
       { cell_id: 'E2', dir: 'Знания', title: 'Глава книги про продуктовые метрики', note: '+10 опыта', done: false, auto: false, via: null },
       { cell_id: 'G1', dir: 'Дом', title: 'Порядок по субботам', note: 'серия 1', done: false, auto: false, via: null },
-      { cell_id: 'H1', dir: 'Свобода', title: 'Шаг по документам раз в 7 дней', note: '+10 опыта', done: false, auto: false, via: null },
+      { cell_id: 'H1', dir: 'Свобода', title: 'Итальянский 3 раза в 7 дней', note: '1/3 на неделе', done: false, auto: false, via: null, periodic: true },
     ];
     const rated = { score: null, past: [3, 5, -2, 4, 6, 2, 0, 7, 4, 3, -1, 5] };      // прошлые дни месяца
     function rating() {
@@ -1184,7 +1190,7 @@
         + (rated.score != null ? 15 : 0);
       return { date: T0, date_label: WD_FULL[wdIdx(day0)].replace(/^./, (s) => s.toUpperCase()) + ', ' + dayMonth(T0), week: isoWeek(day0),
         now: now.toISOString(), character: character(), summary: { done: done, total: list.length, xp_today: xpToday },
-        habits: habits.map((x) => Object.assign({}, x)), rating: rating(), timeline: items.map((i) => i[3]), unscheduled: uns };
+        habits: habits.map((x) => Object.assign({}, x, { due: !x.done && (!x.periodic || /^пора/.test(x.note)) })), rating: rating(), timeline: items.map((i) => i[3]), unscheduled: uns };
     }
     function listView(v) {
       const open = tasks.filter((t) => !t.done && !t.dropped);

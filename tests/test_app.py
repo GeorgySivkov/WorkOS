@@ -277,6 +277,30 @@ def test_rating_slider(c, admin, as_role):
         app_conn.execute("INSERT INTO rpg.day_ratings (day, score) VALUES ('2020-01-01', 10)")
 
 
+def test_periodic_habits_show_when_due(c, admin):
+    """Периодическая привычка не висит каждый день: видна (due), только когда подошёл срок."""
+    seed_grid(admin)
+    admin.execute("""INSERT INTO rpg.cells (id, parent, title, kind, xp_base, auto_source) VALUES
+        ('B2', 'B', 'Пост в LinkedIn раз в 7 дней', 'habit', 10, NULL),
+        ('B3', 'B', 'Разговор с HR раз в 7 дней', 'habit', 10, NULL),
+        ('B4', 'B', 'Созвон с родителями раз в 7 дней', 'habit', 10, NULL)""")
+    today = tu.logical_today()
+    for cell, ago in (("B2", 3), ("B3", 6)):
+        admin.execute("INSERT INTO rpg.xp (cell_id, amount, source, source_ref, earned_at) VALUES (%s, 10, 'manual', %s, %s)",
+                      (cell, f"{cell}:{ago}", at(today - timedelta(days=ago), 12)))
+    hb = {h["cell_id"]: h for h in c.get("/api/today").json()["habits"]}
+    assert hb["A2"]["periodic"] is False and hb["A2"]["due"] is True          # ежедневная: как раньше
+    post, hr, parents = hb["B2"], hb["B3"], hb["B4"]
+    assert post["periodic"] and post["due"] is False and post["note"].startswith("следующий к ")
+    assert hr["due"] is True and hr["note"] == "пора · осталось 1 дн."
+    assert parents["due"] is False and parents["note"].startswith("следующий к ")   # отсчёт от появления в сетке
+    r = c.post("/api/habits/B3/toggle").json()
+    assert r["done"] is True
+    hr = {h["cell_id"]: h for h in c.get("/api/today").json()["habits"]}["B3"]
+    assert hr["done"] is True and hr["due"] is False and hr["note"].startswith("сделано · следующий к ")
+    assert hr["streak"] == 2                                                 # два раза подряд в срок
+
+
 # ---------- лента дня и пересборка ----------
 
 def test_today_timeline(c, srv, admin, monkeypatch):
@@ -394,7 +418,7 @@ def test_character_and_grid(c, admin):
     assert attrs["B"]["rusty"] is True and attrs["B"]["idle_days"] in (19, 20, 21)
     assert ch["next_reward"] == {"level": 1, "title": "Новая книга"}
     assert ch["achievements"][0]["title"] == "Первый квест"
-    assert ch["streaks"][0] == {"cell_id": "A2", "title": "Растяжка", "days": 2}
+    assert ch["streaks"][0] == {"cell_id": "A2", "title": "Растяжка", "days": 2, "forms": ["день", "дня", "дней"]}
 
     g = c.get("/api/grid").json()
     assert g["center"] == {"id": "C", "title": "Главный квест"}

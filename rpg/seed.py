@@ -108,6 +108,8 @@ def seed(conn, cells: list[dict], season: int | None = None, auto: dict | None =
                ON CONFLICT (id) DO UPDATE SET
                  parent = EXCLUDED.parent, title = EXCLUDED.title, kind = EXCLUDED.kind,
                  xp_base = EXCLUDED.xp_base, active = true,
+                 added_on = CASE WHEN rpg.cells.title IS DISTINCT FROM EXCLUDED.title
+                                 THEN current_date ELSE rpg.cells.added_on END,
                  season = COALESCE(%(season)s, rpg.cells.season)
                RETURNING (xmax = 0) AS inserted""",
             {"id": c["id"], "parent": c["parent"], "title": c["title"], "kind": c["kind"],

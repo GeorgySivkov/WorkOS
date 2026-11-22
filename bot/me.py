@@ -1,10 +1,9 @@
 """П.2 · /me: лист персонажа. Только чтение rpg.character, rpg.attributes и rpg.xp."""
 from __future__ import annotations
 
-from datetime import timedelta
-
 from core import timeutil as tu
 from core.tg import esc
+from rpg import period as habit_period
 
 from bot.topics import plural
 
@@ -14,22 +13,17 @@ def bar(done: float, total: float, width: int = 5) -> str:
     return "▰" * k + "▱" * (width - k)
 
 
-def streaks(conn) -> list[tuple[str, int]]:
+def streaks(conn) -> list[tuple[str, int, tuple[str, str, str]]]:
     rows = conn.execute("""SELECT c.title, array_agg(DISTINCT rpg.lday(x.earned_at)) AS days
                            FROM rpg.cells c JOIN rpg.xp x ON x.cell_id = c.id
                            WHERE c.kind = 'habit' AND c.active AND x.earned_at > now() - interval '120 days'
                            GROUP BY c.id, c.title""").fetchall()
     today = tu.logical_today()
     out = []
-    for r in rows:
-        days = set(r["days"] or [])
-        d = today if today in days else today - timedelta(days=1)
-        n = 0
-        while d in days:
-            n += 1
-            d -= timedelta(days=1)
+    for r in rows:                   # серия по периоду привычки: дни, недели, «раз подряд»
+        n, forms = habit_period.streak_of(r["title"], set(r["days"] or []), today)
         if n:
-            out.append((r["title"], n))
+            out.append((r["title"], n, forms))
     return sorted(out, key=lambda x: -x[1])
 
 
@@ -56,5 +50,5 @@ def sheet(conn) -> str:
         lines.append(rl)
     st = streaks(conn)
     if st:
-        lines.append("Серии: " + " · ".join(f"{esc(t)} {n} {plural(n, 'день', 'дня', 'дней')}" for t, n in st[:6]))
+        lines.append("Серии: " + " · ".join(f"{esc(t)} {n} {plural(n, *f)}" for t, n, f in st[:6]))
     return "\n".join(lines)
