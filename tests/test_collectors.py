@@ -801,8 +801,9 @@ def test_ios_alfa_calendar_and_mail(admin, mk_source, ingest_server):
         assert len([e for e in events(admin, "ios:test") if e["kind"] == "email"]) == 1
         assert [e for e in events(admin, "ios:test") if e["kind"] == "email"][0]["meta"]["read"] is True
 
-        # пустой календарь (сбой команды) ничего не отменяет
-        r3 = c.post(f"{ingest_server}/ingest/ios:test", json=_ios_payload(now, [], []), headers=auth).json()
+        # пустой календарь (сбой команды) ничего не отменяет; пустая переменная приходит строкой
+        r3 = c.post(f"{ingest_server}/ingest/ios:test", json={**_ios_payload(now, [], []), "calendar": "", "mail": ""},
+                    headers=auth).json()
         assert r3["cancelled"] == 0
     s = src(admin, "ios:test")
     assert s["last_ok_at"] is not None and s["last_error"] is None

@@ -97,7 +97,7 @@ def _emails(s: str) -> list[str]:
 
 def _list(payload: dict, key: str, limit: int) -> list:
     raw = payload.get(key)
-    if raw is None:
+    if raw is None or raw == "" or raw == {}:     # «Команды» шлют пустую переменную строкой
         return []
     if isinstance(raw, dict):                  # «Команды» отдают один элемент без списка
         raw = [raw]
