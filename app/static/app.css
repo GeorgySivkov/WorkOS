@@ -67,6 +67,52 @@ a { color: var(--gold); }
 .season { position: absolute; right: 20px; top: calc(var(--safe-top) + 18px); text-align: right; z-index: 2; }
 .hero { border: 0; background: transparent; padding: 0; cursor: pointer; filter: drop-shadow(2px 0 0 rgba(255, 190, 110, 0.5)); z-index: 1; }
 .scene.big .hero { filter: drop-shadow(3px 0 0 rgba(255, 190, 110, 0.5)); }
+.hero .walk { display: none; }
+.hero.walking .walk { display: block; opacity: 0; animation: hd-fb 0.5s steps(1) infinite; }
+.hero.walking .base { animation: hd-fa 0.5s steps(1) infinite; }
+.hero.cheer .walk { display: none; }
+.hero.cheer .base { animation: none; opacity: 1; }
+.hero.flinch { margin-left: -4px; }
+
+/* ---------- карта дня ---------- */
+.scene.daymap { height: calc(430px + var(--safe-top)); background: linear-gradient(180deg, #060A1D 0%, #131A44 40%, #151C47 100%); }
+.daymap .scene-title { pointer-events: none; }
+.dm-sky { position: absolute; left: 0; right: 0; top: var(--safe-top); height: 160px; pointer-events: none; }
+.dm-sky > * { position: absolute; }
+.dm-moon { right: 36px; top: 22px; width: 22px; height: 22px; border-radius: 50%; background: #F3E7C6; box-shadow: 0 0 24px 8px rgba(243, 231, 198, 0.28); }
+.dm-star { width: 2px; height: 2px; background: #F3E7C6; animation: hd-twinkle 2.6s ease-in-out infinite; }
+.dm-scroll { position: absolute; inset: 0; z-index: 0; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; }
+.dm-scroll::-webkit-scrollbar { display: none; }
+.dm-scroll.still { overflow-x: hidden; }
+.dm-world { position: absolute; left: 0; bottom: 0; height: 430px; }
+.dm-world > *, .dm-ents > *, .dm-fx > *, .dm-fire > * { position: absolute; }
+.dm-ground { left: 0; top: 0; }
+.dm-ents { left: 0; top: 0; }
+.dm-pine, .dm-fire { pointer-events: none; }
+.dm-glow { left: 50%; top: 50%; width: 160px; height: 116px; margin: -58px 0 0 -80px; background: radial-gradient(ellipse at center, rgba(255, 170, 80, 0.42), rgba(255, 140, 60, 0.12) 45%, transparent 70%); animation: hd-glow 1.6s ease-in-out infinite alternate; }
+.daymap .hero { transition: left 1s linear, top 1s linear; }
+.mk { border: 0; background: transparent; padding: 0; cursor: pointer; }
+.mk::after { content: ''; position: absolute; inset: -8px; }
+.mk.meeting { animation: hd-idle 1.6s steps(2) infinite; }
+.mk.fight { animation: none; filter: drop-shadow(0 0 6px rgba(255, 120, 90, 0.8)); }
+.mk.hit { transform: translateX(6px); filter: brightness(1.7) drop-shadow(0 0 8px #FFF1B8); }
+.mk.lunge { transform: translateX(-10px); }
+.mk.dead { animation: none; transform: scaleY(0.4); transform-origin: 50% 100%; opacity: 0.45; filter: grayscale(1); }
+.mk.task.open, .mk.training.past { opacity: 0.55; }
+.dm-t { transform: translateX(-50%); z-index: 900; pointer-events: none; font-size: 12px; font-weight: 700; line-height: 1; white-space: nowrap; font-variant-numeric: tabular-nums; text-shadow: 0 1px 4px #04060F, 0 0 2px #04060F; }
+.dm-hp { width: 56px; height: 7px; z-index: 900; pointer-events: none; background: #0B0D1C; border: 1px solid #0B0D1C; }
+.dm-hp i { display: block; height: 100%; background: #FF7B5F; }
+.dm-slash { z-index: 950; pointer-events: none; filter: drop-shadow(0 0 6px #FF9F43); }
+.dm-fx { width: 64px; height: 84px; z-index: 960; pointer-events: none; }
+.dm-back { position: absolute; right: 14px; bottom: 14px; z-index: 3; display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--gold-mid); background: rgba(12, 15, 39, 0.9); color: var(--gold-pale); font: inherit; font-size: 13px; padding: 8px 12px; cursor: pointer; }
+.dm-tl { display: flex; gap: 8px; padding: 10px 16px; overflow-x: auto; scrollbar-width: none; background: #0C0F27; border-top: 1px solid rgba(201, 164, 92, 0.45); border-bottom: 1px solid #20254F; }
+.dm-tl::-webkit-scrollbar { display: none; }
+.dmc { flex: none; min-width: 88px; max-width: 150px; text-align: left; border: 1px solid #2A3068; background: #121738; color: inherit; font: inherit; padding: 6px 10px; cursor: pointer; }
+.dmc b { display: block; font-size: 13px; font-variant-numeric: tabular-nums; }
+.dmc span { display: block; font-size: 13px; color: #C9CEE8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dmc.past { opacity: 0.45; }
+.dmc.now { border-color: var(--gold-hi); box-shadow: 0 0 10px rgba(245, 213, 138, 0.35); }
+.has-map .status { margin-top: 12px; }
 .eye { position: absolute; background: #F0C29A; opacity: 0; animation: hd-eye 4.2s steps(1) infinite; }
 
 /* ---------- эффекты выполнения ---------- */

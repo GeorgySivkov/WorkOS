@@ -260,14 +260,309 @@
     return { el: el, stage: front, hero: hero, sprite: sprite, C: C, t: null };
   }
 
+  // ---------- карта дня ----------
+  // Экран «Сегодня» сверху: изометрическая карта, по дороге слева направо лежит день. Встречи стоят монстрами
+  // (вид задаёт контекст), квесты со временем сундуками на дороге, квесты без времени сундуками у утреннего костра.
+  // Герой идёт по времени: между событиями шагает, во время встречи дерётся. Карта листается пальцем.
+  const LOWW = ['.rRkbbbgbbbbkRr.', '.rRkttttttttkRr.', '.RRkTttttttTkRR.', '..RkppppppppkR..', '...kpppkkpppk...',
+    '..kpppk..kpppk..', '..kbbbk..kbbbk..', '.kbbbbk..kbbbbk.', '.kkkkkk..kkkkkk.'];
+  const WALK = IDLE.slice(0, 12).concat(LOWW);
+  const ATTACK = IDLE.slice(0, 7).map((r) => r + '....').concat(['...rrkkSSkkrr.......', '..rRtttggtttRttg....', '..rRtTttttTtttsgwwwW',
+    '.rRktTttttTtkRrg....', '.rRsttttttttsRr.....'], LOW.map((r) => r + '....'));
+  const CHEST_OPEN = ['.kkkkkkkkkk.', 'kggggggggggk', '.kyyyyyyyyk.', 'kyyyyyyyyyyk', 'kggggggggggk', 'kbbbbyybbbbk', 'kbbbbbbbbbbk', 'kbbbbbbbbbbk', 'kggggggggggk', '.kkkkkkkkkk.'];
+  const PINE = ['....g....', '...ggg...', '..ggGgg..', '...ggg...', '..ggggg..', '.ggGgggg.', '..ggggg..', '.ggggggg.', 'gggGggggg', '....b....', '....b....'];
+  const PINE_PAL = { g: '#1E3A4A', G: '#2B5466', b: '#4A2F1C' };
+  // монстры в рост героя (16x21): кадр покоя и кадр выпада (строки, которые в нём другие)
+  const alt = (a, rows) => a.map((r, i) => rows[i] || r);
+  const M_SLIME = ['................', '......kkkk......', '....kkcCcckk....', '...kcCCcccccck..', '..kcCCccccccccck', '.kcCccccccccccck',
+    '.kccwwwccccwwwck', '.kccwweccccwweck', '.kccwweccccwweck', '.kccccccccccccck', 'kcccccccccccccck', 'kcccccccccccccck',
+    'kccckkkkkkkkccck', 'kcccccccccccccck', 'kcccccccccccccck', 'kdccccccccccccdk', 'kddccccccccccddk', 'kdddccccccccdddk',
+    '.kddddddddddddk.', '..kkkkkkkkkkkk..', '................'];
+  const M_IMP = ['.kk..........kk.', '.kck........kck.', '.kcck.kkkk.kcck.', '..kcckcccckcck..', '...kcccccccck...', '..kcCccccccccck.',
+    '..kcwwkccckwwck.', '..kcwecccccewck.', '..kccccccccccck.', '..kcckwkwkwkcck.', '...kcckkkkkcck..', '.kk.kccccccck.kk',
+    'kcckdccccccdkcck', 'kcckdccccccdkcck', '.kk.kdccccdk.kk.', '....kddccddk....', '...kdck..kcdk...', '...kdck..kcdk...',
+    '...kdck..kcdk...', '..kkkkk..kkkkk..', '................'];
+  const M_GHOST = ['................', '.....kkkkkk.....', '...kkcccccckk...', '..kcCCccccccck..', '.kcCcccccccccck.', '.kcccccccccccck.',
+    '.kcckkkcckkkcck.', '.kcckwkcckwkcck.', '.kcckekcckekcck.', '.kcccccccccccck.', '.kccccckkccccck.', '.kccccckkccccck.',
+    'kkcccccccccccckk', 'kcckcccccccckcck', 'kckdccccccccdkck', '.k.kdccccccdk.k.', '...kdccccccdk...', '...kdcdccdcdk...',
+    '...kdkdckdkdk...', '....k.kk.k.k....', '................'];
+  const M_BAT = ['................', '................', '....k......k....', '...kck....kck...', '...kcckkkkcck...', '...kcccccccck...',
+    'k..kcwwccwwck..k', 'kk.kcweccewck.kk', 'kckkcccccccckkck', 'kcckcckwwkcckcck', 'kccckcccccckccck', 'kcccckcccckcccck',
+    'kcdcdkdccdkdcdck', '.kdkk.kddk.kkdk.', '..k...kddk...k..', '......kddk......', '.....kdkkdk.....', '.....kk..kk.....',
+    '................', '................', '................'];
+  const MOBS = {
+    infatica: [M_SLIME, alt(M_SLIME, { 11: 'kccckkkkkkkkccck', 12: 'kccckmwmmwmkccck', 13: 'kccckkkkkkkkccck' }), { c: '#4FB6C2', C: '#9BE3EA', d: '#2C7C88' }],
+    alfa: [M_IMP, alt(M_IMP, { 10: 'kk.kcckkkkkcckkk', 11: 'kckkkccccccckkck', 12: '.kkkdccccccdkkk.', 13: '...kdccccccdk...', 14: '....kdccccdk....' }), { c: '#F08FB0', C: '#FFC4D6', d: '#B0506F' }],
+    personal: [M_GHOST, alt(M_GHOST, { 10: '.kcccckmmkcccck.', 11: '.kcccckkkkcccck.', 12: 'kckcccccccccckck', 13: 'kkkcccccccccckkk', 14: '..kdccccccccdk..' }), { c: '#A3B0FF', C: '#D5DBFF', d: '#6A76C4' }],
+    other: [M_BAT, alt(M_BAT, { 6: '...kcwwccwwck...', 7: '...kcweccewck...', 8: 'kkkkcccccccckkkk' }), { c: '#E3C26B', C: '#F5E3A8', d: '#A78A3C' }],
+  };
+  const MOB_PAL = { k: '#0B0D1C', w: '#F3F7FF', e: '#0B0D1C', m: '#3A1020' };
+
+  const DM = { H: 430, padx: 96, base: 304, tw: 32, th: 16, first: 7, gap: 5, stand: 2, start: 2, lead: 60 * 60000, tail: 90 * 60000, loose: 5, P: 4 };
+  const DM_RUNS = [3, -5, 5, -5, 4, -4, 5];      // серпантин: сколько плиток дорога идёт вниз (+) и вверх (-); после первого отрезка по кругу
+  const MAPV = { follow: true, left: 0 };        // положение карты переживает перерисовку экрана
+  const clamp01 = (f) => Math.min(1, Math.max(0, f));
+  const frames = new Map();                      // готовые box-shadow кадров: строка большая, собирать её на каждый кадр боя незачем
+  function frame(map, pal, P) {
+    let f = frames.get(map);
+    if (!f) { f = spr(map, pal, P); frames.set(map, f); }
+    return f;
+  }
+  function dayModel(d) {
+    const timed = [];
+    for (const it of d.timeline) {
+      if (it.type !== 'meeting' && it.type !== 'task' && it.type !== 'training') continue;
+      const s = Date.parse(it.start), e = Date.parse(it.end);
+      if (isNaN(s)) continue;
+      timed.push({ it: it, kind: it.type, s: s, e: isNaN(e) ? s : Math.max(e, s) });
+    }
+    timed.sort((a, b) => a.s - b.s);
+    timed.forEach((en, i) => { en.step = DM.first + i * DM.gap; en.stand = en.step - DM.stand; });
+    const n = timed.length;
+    const end = n ? timed[n - 1].step + 4 : DM.start;                  // здесь герой встаёт вечером
+    const steps = Math.max(end + 7, 12);
+    const hs = [0];
+    for (let i = 0; hs.length <= steps + 1; i++) {
+      const r = i === 0 ? DM_RUNS[0] : DM_RUNS[1 + (i - 1) % 6];
+      for (let k = 0; k < Math.abs(r) && hs.length <= steps + 1; k++) hs.push(hs[hs.length - 1] + Math.sign(r));
+    }
+    const M = { timed: timed, loose: d.unscheduled.slice(0, DM.loose), more: Math.max(0, d.unscheduled.length - DM.loose), end: end, steps: steps, hs: hs };
+    M.x = (s) => DM.padx + s * DM.tw;
+    M.y = (s) => {
+      const a = Math.max(0, Math.min(steps, Math.floor(s))), f = clamp01(s - a);
+      return DM.base + (hs[a] + (hs[a + 1] - hs[a]) * f) * DM.th;
+    };
+    M.w = M.x(steps);
+    return M;
+  }
+  function dayPos(M, now) {
+    const tm = M.timed, n = tm.length;
+    if (!n) return { s: DM.start, walk: false, fight: null };
+    let idx = -1, maxEnd = -Infinity, busy = null;
+    for (let i = 0; i < n; i++) {
+      if (tm[i].s > now) break;
+      idx = i;
+      maxEnd = Math.max(maxEnd, tm[i].e);
+      if (now < tm[i].e) busy = tm[i];
+    }
+    if (busy) return { s: busy.stand, walk: false, fight: busy.kind === 'meeting' ? busy : null };
+    if (idx < 0) {
+      const f = (now - (tm[0].s - DM.lead)) / DM.lead;
+      return { s: DM.start + (tm[0].stand - DM.start) * clamp01(f), walk: f > 0, fight: null };
+    }
+    if (idx < n - 1) {
+      const span = tm[idx + 1].s - maxEnd;
+      return { s: tm[idx].stand + (tm[idx + 1].stand - tm[idx].stand) * clamp01(span > 0 ? (now - maxEnd) / span : 1), walk: true, fight: null };
+    }
+    const f = (now - maxEnd) / DM.tail;
+    return { s: tm[n - 1].stand + (M.end - tm[n - 1].stand) * clamp01(f), walk: f < 1, fight: null };
+  }
+  function dmState(en, now) {
+    if (en.kind === 'meeting') return en.e <= now ? 'dead' : en.s <= now ? 'fight' : '';
+    return en.it.done ? 'open' : '';
+  }
+  function dmLabel(en, st) {
+    const it = en.it;
+    if (en.kind === 'meeting') return (st === 'dead' ? 'Пройдено · ' : st === 'fight' ? 'Идёт · ' : '') + it.meta + ' · ' + it.title;
+    if (en.kind === 'training') return it.meta + ' · ' + it.title + (it.done ? ' · сделано' : '');
+    return (it.time ? it.time : 'Без времени') + ' · ' + it.title + (it.done ? ' · сделано' : it.xp ? ' · +' + it.xp + ' опыта' : '');
+  }
+  // фигура на карте: x по центру, y по подошве; z по подошве, чтобы ближние перекрывали дальних
+  function dmEnt(tag, x, feet, map, pal, P, props) {
+    const w = map[0].length * P, hh = map.length * P;
+    const px = h('span', { class: 'px', 'aria-hidden': 'true', style: { width: P + 'px', height: P + 'px', boxShadow: pal ? spr(map, pal, P) : map } });
+    const el = h(tag, Object.assign({ 'aria-hidden': tag === 'button' ? null : 'true', type: tag === 'button' ? 'button' : null }, props || {}), px);
+    Object.assign(el.style, { left: Math.round(x - w / 2) + 'px', top: Math.round(feet - hh) + 'px', width: w + 'px', height: hh + 'px', zIndex: String(Math.round(feet)) });
+    el._px = px;
+    return el;
+  }
+  const dmHash = (a, b) => (Math.imul(a, 73856093) ^ Math.imul(b, 19349663)) >>> 0;
+
+  function buildDayMap(opts) {
+    const d = S.today, M = dayModel(d), W = M.w, H = DM.H;
+    const el = h('div', { class: 'scene daymap', role: 'group', 'aria-label': 'Карта дня' });
+    const sky = h('div', { class: 'dm-sky', 'aria-hidden': 'true' }, h('span', { class: 'dm-moon' }),
+      [[8, 30, 0], [22, 12, 0.6], [37, 44, 1.2], [53, 20, 0.3], [68, 52, 1.7], [81, 8, 0.9], [93, 40, 2.1]].map((st) =>
+        h('span', { class: 'dm-star', style: { left: st[0] + '%', top: st[1] + 'px', animationDelay: st[2] + 's' } })));
+    const scroll = h('div', { class: 'dm-scroll' + (M.timed.length ? '' : ' still') });
+    const world = h('div', { class: 'dm-world', style: { width: W + 'px' } });
+
+    // земля: ромбы плиток узором, горы на горизонте, дорога одной скруглённой линией
+    let mount = '0,170';
+    for (let x = 0; x <= W + 44; x += 44) mount += ' ' + x + ',' + (150 - 8 - dmHash(x, 7) % 34);
+    mount += ' ' + (W + 44) + ',170';
+    const pts = [[0, DM.base - 3 * DM.th * Math.sign(DM_RUNS[0])]];
+    for (let s = 0; s <= M.steps; s++) pts.push([M.x(s), DM.base + M.hs[s] * DM.th]);
+    let road = 'M' + pts[0][0] + ' ' + pts[0][1];
+    for (let i = 1; i < pts.length - 1; i++) {
+      const a = pts[i - 1], p = pts[i], b = pts[i + 1], up = Math.sign(p[1] - a[1]), dn = Math.sign(b[1] - p[1]);
+      if (up === dn) continue;
+      road += ' L' + (p[0] - 14) + ' ' + (p[1] - 7 * up) + ' Q' + p[0] + ' ' + p[1] + ' ' + (p[0] + 14) + ' ' + (p[1] + 7 * dn);
+    }
+    road += ' L' + pts[pts.length - 1][0] + ' ' + pts[pts.length - 1][1];
+    const ground = sv('svg', { class: 'dm-ground', width: String(W), height: String(H), viewBox: '0 0 ' + W + ' ' + H, 'aria-hidden': 'true' });
+    ground.innerHTML = '<defs><pattern id="dm-tiles" width="64" height="32" patternUnits="userSpaceOnUse"><rect width="64" height="32" fill="#172048"/>' +
+      '<polygon points="32,0 64,16 32,32 0,16" fill="#1A2450" stroke="#131A40" stroke-width="1"/></pattern>' +
+      '<linearGradient id="dm-fade" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#151C47"/><stop offset="1" stop-color="#151C47" stop-opacity="0"/></linearGradient></defs>' +
+      '<polygon points="' + mount + '" fill="#1C2352"/>' +
+      '<rect x="0" y="160" width="' + W + '" height="' + (H - 160) + '" fill="url(#dm-tiles)"/>' +
+      '<rect x="0" y="160" width="' + W + '" height="70" fill="url(#dm-fade)"/>' +
+      '<path d="' + road + '" fill="none" stroke="#2B2658" stroke-width="40" stroke-linecap="round" stroke-linejoin="round"/>' +
+      '<path d="' + road + '" fill="none" stroke="#4B4374" stroke-width="33" stroke-linecap="round" stroke-linejoin="round"/>' +
+      '<path d="' + road + '" fill="none" stroke="#8A80B8" stroke-width="2" stroke-dasharray="5 11" stroke-linecap="round" opacity="0.5"/>';
+    world.append(ground);
+
+    // ёлки там, где нет ни дороги, ни лагеря
+    for (let m = 0; m * DM.tw <= W; m++) {
+      for (let n = 14; n * DM.th <= H - 6; n++) {
+        if ((m + n) % 2 || dmHash(m, n) % 11) continue;
+        const x = m * DM.tw, y = n * DM.th;
+        if (Math.abs(y - M.y((x - DM.padx) / DM.tw)) < 60 || (x < 250 && y < 300)) continue;
+        world.append(dmEnt('span', x, y + 6, PINE, PINE_PAL, 4, { class: 'dm-pine' }));
+      }
+    }
+    // костры: утренний в начале пути, вечерний в конце
+    const fire = (x, feet) => {
+      const f = dmEnt('span', x, feet, FIRE_A, FPAL, 4, { class: 'dm-fire' });
+      f._px.classList.add('fire-a');
+      f._px.style.animation = 'hd-fa 0.5s steps(1) infinite';
+      f.append(h('span', { class: 'px fire-b', 'aria-hidden': 'true', style: { width: '4px', height: '4px', boxShadow: spr(FIRE_B, FPAL, 4), opacity: '0', animation: 'hd-fb 0.5s steps(1) infinite' } }),
+        h('span', { class: 'dm-glow', 'aria-hidden': 'true' }));
+      world.append(f);
+    };
+    fire(M.x(0) + 14, DM.base - 58);
+    if (M.timed.length) fire(M.x(M.end) + 70, M.y(M.end + 2) - 26);
+
+    const ents = h('div', { class: 'dm-ents' });
+    const P = DM.P;
+    const sprite = h('span', { class: 'px base', 'aria-hidden': 'true', style: { width: P + 'px', height: P + 'px', boxShadow: frame(IDLE, HPAL, P) } });
+    const walk = h('span', { class: 'px walk', 'aria-hidden': 'true', style: { width: P + 'px', height: P + 'px', boxShadow: frame(WALK, HPAL, P) } });
+    const hero = h('button', { type: 'button', class: 'hero', 'aria-label': opts.label, onclick: opts.onHero, style: { width: '64px', height: '84px', animation: 'hd-idle 1.6s steps(2) infinite' } },
+      sprite, walk, [[24, 16], [36, 16]].map((e) => h('span', { class: 'eye', 'aria-hidden': 'true', style: { left: e[0] + 'px', top: e[1] + 'px', width: P + 'px', height: P + 'px' } })));
+    const slash = dmEnt('span', 0, 0, BADGES.star[0], BADGES.star[1], 3, { class: 'dm-slash', hidden: true });
+    const fx = h('div', { class: 'dm-fx', 'aria-hidden': 'true' });
+    world.append(ents, hero, slash, fx);
+    scroll.append(world);
+
+    const back = h('button', { type: 'button', class: 'dm-back', hidden: true }, h('span', { class: 'dia', 'aria-hidden': 'true' }), 'К герою');
+    el.append(sky, scroll, h('span', { class: 'vignette', 'aria-hidden': 'true' }), back);
+
+    const tl = h('div', { class: 'dm-tl', role: 'group', 'aria-label': 'События дня по времени', hidden: !M.timed.length });
+    const sc = { el: el, tl: tl, scroll: scroll, ents: ents, stage: fx, fx: fx, hero: hero, sprite: sprite, slash: slash, back: back, M: M, t: null, fightT: null, auto: 0,
+      C: { P: P, idle: 'hd-idle 1.6s steps(2) infinite', jump: 'hd-jump 0.7s steps(7) 1', spark: [30, 40], float: [-38, -26] } };
+    for (const en of M.timed) {
+      const glyph = en.kind === 'meeting' ? '●' : en.kind === 'training' ? '♥' : '◆';
+      en.chip = h('button', { type: 'button', class: 'dmc', onclick: () => { haptic('select'); dmGo(sc, M.x(en.step) - scroll.clientWidth / 2); } },
+        h('b', { style: { color: en.it.color || '#8FE0BC' } }, glyph + ' ' + (en.it.time || '')), h('span', null, en.it.title));
+      tl.append(en.chip);
+    }
+    scroll.addEventListener('scroll', () => {
+      MAPV.left = scroll.scrollLeft;
+      if (Date.now() > sc.auto && MAPV.follow) { MAPV.follow = false; back.hidden = false; }
+    }, { passive: true });
+    back.addEventListener('click', () => { haptic('select'); MAPV.follow = true; back.hidden = true; dmScroll(sc, sc.hx - 130, true); });
+    return sc;
+  }
+  function dmScroll(sc, left, smooth) {
+    const max = Math.max(0, sc.scroll.scrollWidth - sc.scroll.clientWidth);
+    const x = Math.max(0, Math.min(max, Math.round(left)));
+    sc.auto = Date.now() + (smooth ? 1000 : 300);
+    if (smooth && !reduced() && sc.scroll.scrollTo) sc.scroll.scrollTo({ left: x, behavior: 'smooth' });
+    else sc.scroll.scrollLeft = x;
+    MAPV.left = x;
+  }
+  function dmGo(sc, left) {           // к событию с таймлайна: карта перестаёт ехать за героем, пока не нажмёшь «К герою»
+    MAPV.follow = false;
+    sc.back.hidden = false;
+    dmScroll(sc, left, true);
+  }
+  // карта вставлена в страницу: вернуть положение (до вставки прокрутки у блока ещё нет)
+  function dmSettle(sc) {
+    if (!sc.el.isConnected) return;
+    sc.back.hidden = MAPV.follow;
+    dmScroll(sc, MAPV.follow ? sc.hx - 130 : MAPV.left, false);
+    const cur = sc.M.timed.find((en) => !en.chip.classList.contains('past'));
+    if (cur) sc.tl.scrollLeft = Math.max(0, cur.chip.offsetLeft - 14);
+  }
+  function paintDayMap() {
+    if (!T || !T.sc || !T.sc.M || !S.today) return;
+    const sc = T.sc, M = sc.M, now = Date.now(), pos = dayPos(M, now), P = DM.P, kids = [];
+    const tap = (label) => () => { haptic('select'); toast(label); };
+    sc.foe = null;
+    // квесты без времени: сундуки у утреннего костра, в стороне от дороги
+    const spots = [[-62, 8], [-28, -22], [44, -18], [78, 12], [8, -40]];
+    M.loose.forEach((t, i) => {
+      const label = dmLabel({ it: t, kind: 'task' }, '');
+      kids.push(dmEnt('button', M.x(0) + 14 + spots[i][0], DM.base - 58 + spots[i][1], t.done ? CHEST_OPEN : CHEST, CPAL, 3,
+        { class: 'mk task loose' + (t.done ? ' open' : ''), 'aria-label': label, onclick: tap(label) }));
+    });
+    if (M.more) kids.push(h('span', { class: 'dm-t', 'aria-hidden': 'true', style: { left: (M.x(0) + 14) + 'px', top: (DM.base - 150) + 'px', color: '#C9CEE8' } }, 'и ещё ' + M.more));
+    for (const en of M.timed) {
+      const st = dmState(en, now), x = M.x(en.step), feet = M.y(en.step) + 8, label = dmLabel(en, st);
+      const past = st === 'dead' || st === 'open' || (en.kind === 'training' && en.it.done);
+      const color = en.it.color || '#8FE0BC';
+      let map, pal, p = P, mob = null;
+      if (en.kind === 'meeting') { mob = MOBS[en.it.context_id] || MOBS.other; map = mob[0]; pal = Object.assign({}, MOB_PAL, mob[2]); }
+      else if (en.kind === 'training') { map = BADGES.heart[0]; pal = BADGES.heart[1]; p = 5; }
+      else { map = st === 'open' ? CHEST_OPEN : CHEST; pal = CPAL; }
+      const b = dmEnt('button', x, feet, map, pal, p, { class: 'mk ' + en.kind + (st ? ' ' + st : '') + (past ? ' past' : ''), 'aria-label': label, onclick: tap(label) });
+      kids.push(b);
+      const top = feet - map.length * p;
+      if (!past && en.it.time) {
+        kids.push(h('span', { class: 'dm-t', 'aria-hidden': 'true', style: { left: x + 'px', top: (top - (st === 'fight' ? 30 : 16)) + 'px', color: color } }, en.it.time));
+      }
+      if (st === 'fight') {
+        kids.push(h('span', { class: 'dm-hp', 'aria-hidden': 'true', style: { left: (x - 28) + 'px', top: (top - 12) + 'px' } },
+          h('i', { style: { width: Math.round(clamp01(1 - (now - en.s) / Math.max(1, en.e - en.s)) * 100) + '%' } })));
+        sc.foe = { el: b, a: spr(mob[0], pal, P), b: spr(mob[1], pal, P) };
+      }
+      en.chip.className = 'dmc' + (past ? ' past' : '') + (now >= en.s && now < en.e ? ' now' : '');
+    }
+    sc.ents.replaceChildren.apply(sc.ents, kids);
+    const hx = M.x(pos.s), hy = M.y(pos.s) + 8;
+    sc.hx = hx;
+    sc.pos = pos;
+    Object.assign(sc.hero.style, { left: Math.round(hx - 32) + 'px', top: Math.round(hy - 84) + 'px', zIndex: String(Math.round(hy) + 1) });
+    Object.assign(sc.fx.style, { left: Math.round(hx - 32) + 'px', top: Math.round(hy - 84) + 'px' });
+    Object.assign(sc.slash.style, { left: Math.round(hx + 30) + 'px', top: Math.round(hy - 62) + 'px' });
+    sc.hero.classList.toggle('walking', pos.walk);
+    dmFight(sc);
+    if (MAPV.follow && sc.el.isConnected) dmScroll(sc, hx - 130, false);
+  }
+  // бой: четыре кадра по кругу (стойка, замах, удар, ответный выпад монстра)
+  function dmFight(sc) {
+    clearInterval(sc.fightT);
+    sc.fightT = null;
+    sc.slash.hidden = true;
+    sc.hero.classList.remove('flinch');
+    if (!sc.cheering) sc.sprite.style.boxShadow = frame(IDLE, HPAL, DM.P);
+    if (!sc.foe || reduced()) return;
+    let n = 0;
+    sc.fightT = setInterval(() => {
+      if (!sc.el.isConnected) { clearInterval(sc.fightT); return; }
+      if (sc.cheering || !sc.foe) return;
+      const f = n++ % 4, foe = sc.foe;
+      sc.sprite.style.boxShadow = frame(f === 1 ? VICTORY : f === 2 ? ATTACK : IDLE, HPAL, DM.P);
+      foe.el._px.style.boxShadow = f === 3 ? foe.b : foe.a;
+      foe.el.classList.toggle('hit', f === 2);
+      foe.el.classList.toggle('lunge', f === 3);
+      sc.hero.classList.toggle('flinch', f === 3);
+      sc.slash.hidden = f !== 2;
+    }, 320);
+  }
+
   function heroCheer(sc, ms) {
     sc.sprite.style.boxShadow = spr(VICTORY, HPAL, sc.C.P);
+    sc.cheering = true;
+    sc.hero.classList.add('cheer');
     sc.hero.style.animation = 'none';
     void sc.hero.offsetWidth;
     sc.hero.style.animation = sc.C.jump;
     clearTimeout(sc.t);
     sc.t = setTimeout(() => {
       sc.sprite.style.boxShadow = spr(IDLE, HPAL, sc.C.P);
+      sc.cheering = false;
+      sc.hero.classList.remove('cheer');
       sc.hero.style.animation = sc.C.idle;
     }, ms || 1600);
   }
@@ -369,6 +664,7 @@
   }
   async function show(tab) {
     const switched = S.tab !== tab;
+    if (switched && tab === 'today') MAPV.follow = true;
     S.tab = tab;
     render(!switched);
     if (switched) view.scrollTop = 0;
@@ -399,17 +695,19 @@
   // ---------- «Сегодня» ----------
   function screenToday() {
     const d = S.today;
-    const sc = buildScene('small', { label: 'Персонаж, уровень ' + d.character.level, onHero: () => show('character') });
+    const sc = buildDayMap({ label: 'Персонаж, уровень ' + d.character.level, onHero: () => show('character') });
     sc.el.append(h('div', { class: 'scene-title' }, h('span', { class: 'kicker' }, 'Неделя ' + d.week), h('h1', null, d.date_label)));
     const st = statusPanel();
     const habits = h('section', { class: 'habits', 'aria-labelledby': 'h-title' });
     const quests = h('section', { class: 'quests', 'aria-labelledby': 'q-title' });
     const rate = d.rating ? ratePanel(d.rating) : null;
     T = { sc: sc, st: st, habits: habits, quests: quests, rate: rate };
+    paintDayMap();
+    requestAnimationFrame(() => dmSettle(sc));
     paintStatus(d.character, d.summary, false);
     paintHabits();
     paintQuests();
-    return h('div', { class: 'screen' }, sc.el, st.el, d.habits.length ? habits : null, rate ? rate.el : null, quests);
+    return h('div', { class: 'screen has-map' }, sc.el, sc.tl, st.el, d.habits.length ? habits : null, rate ? rate.el : null, quests);
   }
 
   // ---------- оценка дня: ползунок -10..+10, пишет rpg.log_rating (как /day в боте) ----------
@@ -701,7 +999,7 @@
       if (S.today) {
         S.today.summary.done = Math.max(0, S.today.summary.done + (was ? -1 : 1));
         if (!was) S.today.summary.xp_today += r.xp || 0;
-        if (S.tab === 'today') paintStatus(S.today.character, S.today.summary, !!r.level_up);
+        if (S.tab === 'today') { paintStatus(S.today.character, S.today.summary, !!r.level_up); paintDayMap(); }
       }
       if (!was) celebrate(t, r, before);
       if (where === 'list' && !was) {
@@ -1336,10 +1634,11 @@
     if (DEMO) app.append(h('span', { class: 'demo-flag', 'aria-hidden': 'true' }, 'ДЕМО'));
     tabbar.hidden = false;
     show('today');
-    document.addEventListener('visibilitychange', () => { if (!document.hidden && !closeSheet) refreshTab(); });
+    document.addEventListener('visibilitychange', () => { if (!document.hidden && !closeSheet) { MAPV.follow = true; refreshTab(); } });
     setInterval(() => {
       if (!document.hidden && S.tab === 'today' && !closeSheet && Date.now() > (S.fxUntil || 0)) refreshTab();
     }, 5 * 60 * 1000);
+    setInterval(() => { if (!document.hidden && S.tab === 'today') paintDayMap(); }, 30 * 1000);     // герой идёт и между обновлениями
   }
   start();
 })();
