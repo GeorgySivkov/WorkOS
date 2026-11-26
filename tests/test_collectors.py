@@ -201,6 +201,48 @@ def naive_utc(dt: datetime) -> str:
     return dt.astimezone(UTC).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
+def plaud_flaky(codes: list[int]):
+    """Список записей отвечает кодами по очереди; после них 200 с пустым списком."""
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req.url.path)
+        code = codes.pop(0) if codes else 200
+        if code != 200:
+            return httpx.Response(code, json={"detail": "UNKNOWN_ERROR"})
+        return httpx.Response(200, json={"data": [{"id": "a"}], "page": 1})
+    return httpx.MockTransport(handler), calls
+
+
+def test_plaud_retries_server_errors(monkeypatch, tmp_path):
+    """Разовый 500 от Plaud не ошибка источника: GET повторяется с паузами и проходит."""
+    from collectors import plaud
+    plaud_tokens(tmp_path, monkeypatch)
+    slept = []
+    monkeypatch.setattr(plaud.time, "sleep", slept.append)
+    t, calls = plaud_flaky([500, 502])
+    assert plaud.make_api(transport=t).list_recordings() == [{"id": "a"}]
+    assert len(calls) == 3 and slept == [2.0, 5.0]
+
+
+def test_plaud_gives_up_after_retries_and_skips_client_errors(monkeypatch, tmp_path):
+    """Plaud лежит дольше повторов: ошибка доходит до сторожа. 4xx не повторяется вовсе."""
+    from collectors import plaud
+    plaud_tokens(tmp_path, monkeypatch)
+    slept = []
+    monkeypatch.setattr(plaud.time, "sleep", slept.append)
+    t, calls = plaud_flaky([500, 500, 500])
+    with pytest.raises(plaud.PlaudError, match="500"):
+        plaud.make_api(transport=t).list_recordings()
+    assert len(calls) == 3 and slept == [2.0, 5.0]
+
+    slept.clear()
+    t, calls = plaud_flaky([400])
+    with pytest.raises(plaud.PlaudError, match="400"):
+        plaud.make_api(transport=t).list_recordings()
+    assert len(calls) == 1 and slept == []
+
+
 def test_plaud_transcript_ready_and_calendar_match(admin, mk_source, role_env, monkeypatch, tmp_path):
     from collectors.plaud import PlaudCollector
     plaud_tokens(tmp_path, monkeypatch)

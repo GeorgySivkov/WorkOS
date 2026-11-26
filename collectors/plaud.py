@@ -111,6 +111,7 @@ class PlaudAPI:
     TRANSCRIPT_BLOCK = "transaction"
     SUMMARY_NOTE = "auto_sum_note"
     SKEW_MS = 60_000
+    RETRY_PAUSES = (2.0, 5.0)                       # секунды перед повторами GET при ответе 5xx
 
     def __init__(self, tokens_file: str, base: str = DEFAULT_BASE,
                  transport: httpx.BaseTransport | None = None):
@@ -161,14 +162,19 @@ class PlaudAPI:
         return t["access_token"]
 
     def _get(self, path: str, params: dict | None = None) -> httpx.Response:
-        for attempt in (0, 1):
+        pauses = list(self.RETRY_PAUSES)
+        refreshed = False
+        while True:
             r = self.http.get(path, params=params,
                               headers={"Authorization": f"Bearer {self.access_token()}"})
-            if r.status_code == 401 and attempt == 0:
+            if r.status_code == 401 and not refreshed:
+                refreshed = True
                 self.refresh()                       # токен отозвали раньше срока: одна попытка
                 continue
+            if r.status_code >= 500 and pauses:
+                time.sleep(pauses.pop(0))            # у Plaud бывают разовые 500: не поднимать из-за них тревогу
+                continue
             return r
-        return r
 
     def _check(self, r: httpx.Response):
         if r.status_code == 401:
