@@ -264,6 +264,36 @@ def test_capture_task_with_date(term, tg, admin):
     assert tg.of("sendMessage") == []
 
 
+def test_pending_note_from_watch_is_captured(term, tg, admin):
+    """Заметка с часов лежит в work.events с capture_pending: тик размечает её и отвечает во «Входящие»."""
+    fake_model({"capture": TASK_ANSWER})
+    eid = admin.execute(
+        """INSERT INTO work.events (context_id, source_id, external_id, kind, occurred_at, title, body, meta)
+           VALUES ('personal', 'ios:notes', 'n1', 'note', now(), 'позвонить в банк', 'позвонить в банк в пт в 10',
+                   '{"capture_pending": true, "via": "siri"}') RETURNING id""").fetchone()["id"]
+    assert capture.pending_notes(term.ctx) == 1
+    ev = admin.execute("SELECT * FROM work.events WHERE id = %s", (eid,)).fetchone()
+    assert ev["meta"]["capture_pending"] is False and ev["meta"]["class"]["kind"] == "task"
+    assert ev["context_id"] == "infatica" and ev["meta"]["task_id"]
+    task = admin.execute("SELECT * FROM work.tasks WHERE id = %s", (ev["meta"]["task_id"],)).fetchone()
+    assert task["source"] == "capture" and task["due"] == date(2026, 10, 23)
+    reply = tg.last("sendMessage")
+    assert int(reply["message_thread_id"]) == term.ctx.thread_of("inbox")
+    assert "🎙" in reply["text"] and "позвонить в банк в пт в 10" in reply["text"] and "Задача" in reply["text"]
+    assert {f"cap:{eid}:task", f"cap:{eid}:idea", f"cap:{eid}:fact"} <= set(buttons(reply))
+    assert ev["meta"]["reply_id"]
+    # кнопки поправки работают для события из ios:notes
+    tg.reset()
+    press(term, f"cap:{eid}:idea", int(ev["meta"]["reply_id"]))
+    ev2 = admin.execute("SELECT meta FROM work.events WHERE id = %s", (eid,)).fetchone()
+    assert ev2["meta"]["class"]["kind"] == "idea"
+    # второй тик: ничего не задваивается
+    tg.reset()
+    assert capture.pending_notes(term.ctx) == 0
+    assert tg.of("sendMessage") == []
+    admin.execute("DELETE FROM work.events WHERE id = %s", (eid,))
+
+
 def test_capture_low_confidence_has_context_buttons_and_photo(term, tg, admin):
     fake_model({"capture": {"kind": "fact", "context_id": "alfa", "confidence": 0.4, "title": "SLA"}})
     send(term, message(term, None, caption="SLA поддержки 15 минут https://x.y", photo=[{"file_id": "p1"}]))

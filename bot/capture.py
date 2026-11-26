@@ -7,6 +7,10 @@ work.tasks: George её сам написал, подтверждать нече
 
 callback_data: cap:<event_id>:task|idea|fact · cap:<event_id>:ctx:<context_id>
 · cap:<event_id>:cell · cap:<event_id>:c:<cell_id|->
+
+Заметки с часов (источник ios:notes, см. collectors/ios.py): приёмник кладёт
+событие с meta.capture_pending, фоновый тик бота (pending_notes) размечает его
+тем же путём и шлёт ответ во «Входящие» с текстом заметки; кнопки поправки те же.
 """
 from __future__ import annotations
 
@@ -22,6 +26,8 @@ from bot.topics import Ctx, contexts, short_date
 log = logging.getLogger("workos.bot")
 
 SOURCE = "telegram:inbox"
+NOTE_SOURCES = ("ios:notes",)          # заметки с часов через приёмник: те же кнопки поправки
+NOTES_BATCH = 10
 KINDS = ("task", "idea", "fact", "question")
 KIND_LABEL = {"task": "Задача", "idea": "Идея", "fact": "В базу", "question": "Вопрос"}
 SURE = 0.7
@@ -303,8 +309,36 @@ def handle(ctx: Ctx, msg: dict, text: str | None = None, voice: bool = False,
 
 
 def _load(conn, eid: int) -> dict | None:
-    return conn.execute("SELECT id, context_id, body, meta FROM work.events WHERE id = %s AND source_id = %s",
-                        (eid, SOURCE)).fetchone()
+    return conn.execute("SELECT id, context_id, body, meta FROM work.events WHERE id = %s AND source_id = ANY(%s)",
+                        (eid, [SOURCE, *NOTE_SOURCES])).fetchone()
+
+
+def pending_notes(ctx: Ctx, now: datetime | None = None) -> int:
+    """Заметки с часов, которые приёмник записал, а бот ещё не разметил. Возвращает число разобранных."""
+    conn = ctx.conn
+    rows = conn.execute("""SELECT id, body, occurred_at FROM work.events
+                           WHERE source_id = ANY(%s) AND (meta->>'capture_pending') = 'true'
+                           ORDER BY id LIMIT %s""", (list(NOTE_SOURCES), NOTES_BATCH)).fetchall()
+    done = 0
+    for r in rows:
+        body = (r["body"] or "").strip()
+        if not body:
+            merge_meta(conn, r["id"], {"capture_pending": False})
+            continue
+        cls = classify(conn, body, min(r["occurred_at"], now or tu.now()))
+        with conn.transaction():
+            patch = {"class": cls, "capture_pending": False}
+            if cls["kind"] == "task":
+                patch["task_id"] = create_task(conn, cls)
+            conn.execute("UPDATE work.events SET context_id = %s, meta = meta || %s WHERE id = %s",
+                         (cls["context"], db.jb(patch), r["id"]))
+        text_out, btns = render(conn, r["id"], cls,
+                                note="модель недоступна, разобрал по датам" if cls["model"] == "ruparse" else None)
+        sent = ctx.send("inbox", f"🎙 <i>{esc(body[:1000])}</i>\n{text_out}", btns)
+        if sent and sent.get("message_id"):
+            merge_meta(conn, r["id"], {"reply_id": sent["message_id"]})
+        done += 1
+    return done
 
 
 def _task_state(conn, task_id) -> dict | None:

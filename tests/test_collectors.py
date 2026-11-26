@@ -851,12 +851,47 @@ def test_ios_alfa_calendar_and_mail(admin, mk_source, ingest_server):
     assert s["last_ok_at"] is not None and s["last_error"] is None
 
 
+def test_ios_notes_from_watch(admin, mk_source, ingest_server):
+    """Siri на часах -> команда «Заметка» -> {"now","text"}: событие для захвата, повтор не дублирует."""
+    from health import problem
+    mk_source("ios:ntest", "ios", "personal", {"format": "notes", "health_hours": 0})
+    auth = {"Authorization": f"Bearer {TOKEN}"}
+    now = datetime(2026, 11, 20, 13, 30, tzinfo=timezone(timedelta(hours=1)))
+    body = {"now": now.isoformat(timespec="seconds"), "text": "  позвонить   в банк\nв пятницу "}
+    with httpx.Client(timeout=10) as c:
+        r1 = c.post(f"{ingest_server}/ingest/ios:ntest", json=body, headers=auth)
+        assert r1.status_code == 200 and r1.json()["inserted"] == 1
+        r2 = c.post(f"{ingest_server}/ingest/ios:ntest", json=body, headers=auth)
+        assert r2.status_code == 200 and r2.json()["inserted"] == 0 and r2.json()["note"] == r1.json()["note"]
+        assert c.post(f"{ingest_server}/ingest/ios:ntest", json={"now": body["now"], "text": "  "},
+                      headers=auth).status_code == 400
+        assert c.post(f"{ingest_server}/ingest/ios:ntest", json={"text": "без времени"}, headers=auth).status_code == 200
+    rows = events(admin, "ios:ntest")
+    assert len(rows) == 2
+    ev = [r for r in rows if r["external_id"] == r1.json()["note"]][0]
+    assert ev["kind"] == "note" and ev["body"] == "позвонить в банк в пятницу" and ev["context_id"] == "personal"
+    assert ev["meta"]["capture_pending"] is True and ev["meta"]["via"] == "siri"
+    assert ev["occurred_at"] == now.astimezone(UTC)
+    # повтор после разметки ботом не возвращает capture_pending
+    admin.execute("UPDATE work.events SET meta = meta || '{\"capture_pending\": false}' WHERE id = %s", (ev["id"],))
+    with httpx.Client(timeout=10) as c:
+        c.post(f"{ingest_server}/ingest/ios:ntest", json=body, headers=auth)
+    assert [r for r in events(admin, "ios:ntest") if r["id"] == ev["id"]][0]["meta"]["capture_pending"] is False
+    s = src(admin, "ios:ntest")
+    assert s["last_ok_at"] is not None
+    # нерегулярный источник: молчание не тревога
+    assert problem({**s, "last_ok_at": None, "last_error": None}, tu.now()) is None
+
+
 def test_ios_source_seeded_and_health_threshold(admin):
     from health import threshold
     s = src(admin, "ios:alfa")
     assert s["kind"] == "ios" and s["context_id"] == "alfa" and s["enabled"] is False
     assert s["config"]["account"] == "Alfabank"
     assert threshold({"kind": "ios", "config": {}}) == 13.0
+    n = src(admin, "ios:notes")
+    assert n["kind"] == "ios" and n["context_id"] == "personal" and n["enabled"] is False
+    assert n["config"]["format"] == "notes" and threshold(n) == 0
 
 
 # ---------------- коллектор на Маке ----------------

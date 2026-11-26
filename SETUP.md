@@ -170,11 +170,17 @@ done
      Повторная отправка безопасна: записи с тем же id обновляются, а не дублируются.
    - EAS (`collectors/eas.py`, источник `eas:alfa`) остаётся в коде выключенным; `workos-eas` при
      выключенном источнике выходит с кодом 3 и не перезапускается.
+   - **Голосовые заметки с часов (fenix 8 → Siri → приёмник).** Источник `ios:notes` (миграция 015),
+     формат `{"now": ISO, "text": "..."}` на `http://<tailnet-ip>:8788/ingest/ios:notes`, тот же `INGEST_TOKEN`.
+     Бот раз в ~20 с размечает заметку как захват и отвечает во «Входящие» (🎙 + кнопки поправки).
+     Команда «Заметка» в «Командах» (см. `docs/shortcut-note.md`), запуск голосом с часов: «Siri, заметка».
+     `UPDATE work.sources SET enabled = true WHERE id = 'ios:notes';`
 8. **Включить источники:**
    ```sql
    UPDATE work.sources SET enabled = true, config = '{"board_id":"6a197760b7795b2a91550ec0"}' WHERE id = 'trello:george';
    UPDATE work.sources SET enabled = true WHERE id IN ('plaud','ical:personal','ical:infatica');
    UPDATE work.sources SET enabled = true WHERE id = 'ios:alfa';      -- Альфа через айфон, шаг 7
+   UPDATE work.sources SET enabled = true WHERE id = 'ios:notes';     -- заметки с часов, шаг 7
    UPDATE work.sources SET enabled = true, config = '{"channels":["C..."],"user_id":"U..."}' WHERE id = 'slack:infatica';
    ```
    (под админом: `set -a; . .env.admin; set +a; psql`). Потом `bash deploy/phase.sh 2`.

@@ -60,9 +60,12 @@ def problem(src: dict, now: datetime) -> str | None:
     if src["last_error"]:
         first = src["last_error"].strip().splitlines()[0][:300]
         return f"ошибка: <code>{esc(first)}</code>"
+    hours = threshold(src)
+    if hours <= 0:                      # нерегулярный источник (заметки с часов): молчание не тревога
+        return None
     if src["last_ok_at"] is None:
         return "ещё ни разу не отработал"
-    if now - src["last_ok_at"] > timedelta(hours=threshold(src)):
+    if now - src["last_ok_at"] > timedelta(hours=hours):
         return f"молчит {_ago(now, src['last_ok_at'])} (последняя синхронизация {_when(src['last_ok_at'])})"
     return None
 

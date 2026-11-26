@@ -26,6 +26,13 @@ work.calendar_feed, как встречи из EAS.
 
 Настройки источника (work.sources.config): {"account": "Alfabank",
 "window_days": 60, "health_hours": 13}.
+
+Заметки (источник ios:notes, config {"format": "notes"}): Siri на часах
+(fenix 8 прокидывает голос на айфон) запускает команду «Заметка», та диктует
+текст и шлёт POST /ingest/ios:notes {"now": ISO, "text": "..."} (без аудио).
+Событие kind='note' с meta.capture_pending = true; бот (bot/capture.py,
+pending_notes) размечает его как заметку из «Входящих» и отвечает в теме.
+id = хеш (now, text): повтор той же команды не дублирует заметку.
 """
 from __future__ import annotations
 
@@ -42,6 +49,7 @@ WINDOW_DAYS = 60
 MAX_CAL = 2000
 MAX_MAIL = 2000
 BODY_LIMIT = 50_000
+NOTE_LIMIT = 4_000
 EMAIL_RE = re.compile(r"[\w.+\-']+@[\w\-]+(?:\.[\w\-]+)+")
 TRUE = {"1", "true", "yes", "да", "on"}
 
@@ -179,3 +187,19 @@ WHERE source_id = %s AND kind = 'calendar'
 def cancel_missing(conn, source_id: str, window: tuple[datetime, datetime], seen: list[str]) -> int:
     cur = conn.execute(CANCEL_SQL, (source_id, window[0], window[1], seen))
     return cur.rowcount or 0
+
+
+# ---------- голосовые заметки с часов ----------
+def parse_note(payload: dict, config: dict | None = None) -> Event:
+    """{"now", "text"} -> событие-заметка для захвата ботом."""
+    if not isinstance(payload, dict):
+        raise BadPayload("ожидается объект JSON")
+    text = " ".join(_text(payload.get("text"), "text", NOTE_LIMIT * 2).split())[:NOTE_LIMIT]
+    if not text:
+        raise BadPayload("пустая заметка")
+    now = _when(payload.get("now"), "now", required=False) or tu.now()
+    if now > tu.now() + timedelta(minutes=5):      # часы айфона убежали вперёд: не из будущего
+        now = tu.now()
+    ext = _text(payload.get("id"), "id", 64) or _hash(_iso(now), text)
+    return Event(external_id=ext, kind="note", occurred_at=now, title=text[:120], body=text,
+                 meta={"capture_pending": True, "via": "siri", "voice": True})

@@ -5,8 +5,8 @@
 Telegram передоставит неподтверждённое, а захват идемпотентен по id сообщения.
 
 Фоновый поток (своё соединение с базой и свой httpx-клиент): outbox раз в 2 с
-(тихие часы 1:00-8:00: ничего не шлёт), раз в ~20 с карточки proposed-действий
-и автономные одобрения, раз в минуту напоминания, раз в 5 минут пинг healthchecks.
+(тихие часы 1:00-8:00: ничего не шлёт), раз в ~20 с карточки proposed-действий,
+заметки с часов (ios:notes -> захват во «Входящие») и автономные одобрения, раз в минуту напоминания, раз в 5 минут пинг healthchecks.
 Ошибка обработчика никогда не роняет цикл: журнал + короткое сообщение в «Систему».
 """
 from __future__ import annotations
@@ -437,7 +437,8 @@ class Terminal:
 
     def tick(self, ctx: Ctx | None = None, force: bool = False) -> dict:
         ctx = ctx or self.ctx
-        out = {"cards": self._safe(ctx, "cards", cards.process_proposed, ctx)}
+        out = {"cards": self._safe(ctx, "cards", cards.process_proposed, ctx),
+               "notes": self._safe(ctx, "notes", capture.pending_notes, ctx)}
         if self._due("remind", REMIND_EVERY, force):
             out["reminders"] = self._safe(ctx, "reminders", reminders, ctx)
             out["rating_ask"] = self._safe(ctx, "rating", rating.ask, ctx)

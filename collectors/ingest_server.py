@@ -11,7 +11,10 @@ workos_reader). Слушает INGEST_BIND (по умолчанию 127.0.0.1:87
 
 Принимается только для включённых источников вида 'achat' и 'ios'.
 Источник 'ios' (Альфа через «Команды» айфона) шлёт свой формат, его разбирает
-collectors/ios.py: {"now", "calendar": [...], "mail": [...]}. Запись
+collectors/ios.py: {"now", "calendar": [...], "mail": [...]}. Источник 'ios' с
+config.format = "notes" (голосовые заметки с часов через Siri) принимает
+{"now", "text"}: событие kind='note' с meta.capture_pending, бот размечает его
+как захват из «Входящих». Повтор с тем же (now, text) не пишется второй раз. Запись
 идемпотентна (collectors.base.upsert_events), last_ok_at и watermark
 обновляются. Тело запроса не больше 10 МБ. kind всегда 'message' (другое: 400),
 в meta только известные ключи А-Чата со строками и числами (META_KEYS), остальное: 400,
@@ -135,6 +138,8 @@ def ingest(source_id: str, payload: dict) -> tuple[int, dict]:
 
 def _ingest_ios(conn, src: dict, payload: dict) -> tuple[int, dict]:
     from collectors import ios
+    if (src.get("config") or {}).get("format") == "notes":
+        return _ingest_note(conn, src, payload)
     try:
         cal, mail, window = ios.parse(payload, src.get("config") or {})
     except ios.BadPayload as e:
@@ -145,6 +150,24 @@ def _ingest_ios(conn, src: dict, payload: dict) -> tuple[int, dict]:
                  (str(payload.get("now"))[:64], src["id"]))
     return 200, {"inserted": ins, "updated": upd, "calendar": len(cal), "mail": len(mail),
                  "cancelled": cancelled}
+
+
+def _ingest_note(conn, src: dict, payload: dict) -> tuple[int, dict]:
+    """Одна заметка с часов. Не через upsert_events: повтор не должен снова ставить capture_pending."""
+    from collectors import ios
+    try:
+        ev = ios.parse_note(payload, src.get("config") or {})
+    except ios.BadPayload as e:
+        return 400, {"error": str(e)}
+    row = conn.execute(
+        """INSERT INTO work.events (context_id, source_id, external_id, kind, occurred_at, title, body, meta)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (source_id, external_id) DO NOTHING RETURNING id""",
+        (src.get("context_id") or "personal", src["id"], ev.external_id, ev.kind, ev.occurred_at,
+         ev.title, ev.body, db.jb(ev.meta))).fetchone()
+    conn.execute("UPDATE work.sources SET watermark = %s, last_ok_at = now(), last_error = NULL WHERE id = %s",
+                 (ev.external_id, src["id"]))
+    return 200, {"inserted": 1 if row else 0, "updated": 0, "note": ev.external_id}
 
 
 def make_handler(token: str):
